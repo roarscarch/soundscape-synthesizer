@@ -9,6 +9,11 @@ from hashlib import sha256
 from typing import List, Tuple, Optional
 
 
+def seed_to_int(seed: str) -> int:
+    """Convert a seed string to a deterministic integer using SHA-256."""
+    return int(sha256(seed.encode()).hexdigest(), 16)
+
+
 class Grain:
     """A single audio grain: a short waveform segment with spectral properties."""
 
