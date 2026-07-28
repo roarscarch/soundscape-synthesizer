@@ -39,144 +39,99 @@ class Biome:
         self.envelope_decay = envelope_decay
         self.grain_duration = grain_duration
         self.sample_rate = sample_rate
-        self.seed = seed or name
+        self.seed = seed
 
-        # Build the wave table (list of waveforms)
-        self.wave_table = self._build_wave_table()
+        self._wave_table = None
 
-    def _build_wave_table(self) -> List[np.ndarray]:
-        """
-        Generate a wave table from base frequencies and harmonics,
-        with deterministic variation from the seed.
+    def _generate_wave_table(self) -> np.ndarray:
+        """Generate the wave table as a 2D array (num_grains x grain_length).
+        Each grain is a harmonic waveform shaped by the envelope.
         """
         rng = np.random.default_rng(
-            int(sha256(self.seed.encode()).hexdigest(), 16) & 0xFFFFFFFF
+            int(sha256((self.seed or self.name).encode()).hexdigest(), 16)
         )
-        wave_table = []
-        duration_samples = int(self.sample_rate * self.grain_duration)
-        t = np.linspace(0, self.grain_duration, duration_samples, endpoint=False)
 
-        for freq in self.base_frequencies:
-            # Build harmonic series
-            waveform = np.zeros(duration_samples, dtype=np.float32)
-            for i, amp in enumerate(self.harmonics):
-                harmonic_freq = freq * (i + 1)
-                phase = rng.uniform(0, 2 * np.pi)  # deterministic random phase
-                waveform += amp * np.sin(2 * np.pi * harmonic_freq * t + phase)
+        grain_samples = int(self.sample_rate * self.grain_duration)
+        t = np.arange(grain_samples) / self.sample_rate
 
-            # Normalize to [-1, 1]
-            max_val = np.max(np.abs(waveform))
-            if max_val > 0:
-                waveform /= max_val
-
-            # Apply envelope
-            envelope = self._envelope(duration_samples)
-            waveform *= envelope
-
-            wave_table.append(waveform)
-
-        return wave_table
-
-    def _envelope(self, num_samples: int) -> np.ndarray:
-        """Create an amplitude envelope (attack-decay) for a grain."""
+        # Envelope: linear attack and decay
         attack_samples = int(self.sample_rate * self.envelope_attack)
         decay_samples = int(self.sample_rate * self.envelope_decay)
-        sustain_samples = num_samples - attack_samples - decay_samples
-
-        if sustain_samples < 0:
-            # Short grain: scale envelope to fit
-            total = attack_samples + decay_samples
-            attack_ratio = attack_samples / total
-            decay_ratio = decay_samples / total
-            attack_samples = int(num_samples * attack_ratio)
-            decay_samples = num_samples - attack_samples
-            sustain_samples = 0
-
-        envelope = np.ones(num_samples, dtype=np.float32)
-        # Attack: linear ramp up
+        envelope = np.ones(grain_samples)
         if attack_samples > 0:
-            envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
-        # Decay: linear ramp down
+            envelope[:attack_samples] = np.linspace(0.0, 1.0, attack_samples)
         if decay_samples > 0:
-            envelope[-decay_samples:] = np.linspace(1, 0, decay_samples)
-        return envelope
+            envelope[-decay_samples:] = np.linspace(1.0, 0.0, decay_samples)
 
-    def get_wave_table(self) -> List[np.ndarray]:
-        """Return the wave table (list of waveforms)."""
-        return self.wave_table
+        table = []
+        for freq in self.base_frequencies:
+            # Build harmonic waveform
+            wave = np.zeros(grain_samples, dtype=np.float32)
+            for i, amp in enumerate(self.harmonics):
+                harmonic_freq = freq * (i + 1)
+                wave += amp * np.sin(2 * np.pi * harmonic_freq * t)
+            # Normalize to avoid clipping
+            max_abs = np.max(np.abs(wave))
+            if max_abs > 0:
+                wave /= max_abs
+            wave *= envelope
+            table.append(wave)
 
-    def get_params(self) -> dict:
-        """Return a dictionary of biome parameters for serialization."""
-        return {
-            "name": self.name,
-            "base_frequencies": self.base_frequencies,
-            "harmonics": self.harmonics.tolist(),
-            "envelope_attack": self.envelope_attack,
-            "envelope_decay": self.envelope_decay,
-            "grain_duration": self.grain_duration,
-            "sample_rate": self.sample_rate,
-            "seed": self.seed,
-        }
+        return np.array(table, dtype=np.float32)
+
+    @property
+    def wave_table(self) -> np.ndarray:
+        """Lazy-computed wave table."""
+        if self._wave_table is None:
+            self._wave_table = self._generate_wave_table()
+        return self._wave_table
+
+    def get_grain(self, index: int) -> np.ndarray:
+        """Return a single grain waveform by index (modulo wave table size)."""
+        return self.wave_table[index % len(self.wave_table)]
+
+    def __repr__(self) -> str:
+        return f"Biome(name={self.name!r}, grains={len(self.base_frequencies)})"
 
 
-# Predefined biomes
-BIOME_REGISTRY: Dict[str, Biome] = {}
+# --- Preset biome instances ---
 
-
-def _register_biome(name: str, biome: Biome) -> None:
-    """Register a biome in the global registry."""
-    BIOME_REGISTRY[name] = biome
-
-
-# Forest biome
-_register_biome(
-    "forest",
-    Biome(
-        name="forest",
-        base_frequencies=[60, 120, 180, 240, 300],
-        harmonics=[1.0, 0.3, 0.15, 0.08, 0.04],
-        envelope_attack=0.05,
-        envelope_decay=0.3,
-        grain_duration=0.5,
-        sample_rate=44100,
-        seed="forest_default",
-    ),
+FOREST_BIOME = Biome(
+    name="forest",
+    base_frequencies=[110.0, 146.83, 196.0, 246.94],  # A2, D3, G3, B3
+    harmonics=[1.0, 0.4, 0.2, 0.1, 0.05],
+    envelope_attack=0.05,
+    envelope_decay=0.3,
+    grain_duration=0.4,
+    sample_rate=44100,
+    seed="forest_preset",
 )
 
-# Ocean biome
-_register_biome(
-    "ocean",
-    Biome(
-        name="ocean",
-        base_frequencies=[40, 80, 160, 320],
-        harmonics=[1.0, 0.5, 0.25, 0.125],
-        envelope_attack=0.1,
-        envelope_decay=0.4,
-        grain_duration=0.8,
-        sample_rate=44100,
-        seed="ocean_default",
-    ),
+OCEAN_BIOME = Biome(
+    name="ocean",
+    base_frequencies=[55.0, 110.0, 220.0],  # A1, A2, A3
+    harmonics=[1.0, 0.3, 0.15, 0.08],
+    envelope_attack=0.1,
+    envelope_decay=0.8,
+    grain_duration=0.8,
+    sample_rate=44100,
+    seed="ocean_preset",
 )
 
-# Space biome
-_register_biome(
-    "space",
-    Biome(
-        name="space",
-        base_frequencies=[30, 55, 110, 220, 440],
-        harmonics=[1.0, 0.2, 0.1, 0.05, 0.02],
-        envelope_attack=0.2,
-        envelope_decay=0.6,
-        grain_duration=1.0,
-        sample_rate=44100,
-        seed="space_default",
-    ),
+SPACE_BIOME = Biome(
+    name="space",
+    base_frequencies=[65.41, 98.0, 130.81, 196.0],  # C2, G2, C3, G3
+    harmonics=[1.0, 0.6, 0.3, 0.15, 0.07],
+    envelope_attack=0.2,
+    envelope_decay=1.5,
+    grain_duration=1.0,
+    sample_rate=44100,
+    seed="space_preset",
 )
 
-def get_biome(name: str) -> Optional[Biome]:
-    """Get a biome by name from the registry."""
-    return BIOME_REGISTRY.get(name)
-
-def list_biomes() -> List[str]:
-    """Return list of available biome names."""
-    return list(BIOME_REGISTRY.keys())
+# Registry for easy lookup
+BIOME_REGISTRY: Dict[str, Biome] = {
+    "forest": FOREST_BIOME,
+    "ocean": OCEAN_BIOME,
+    "space": SPACE_BIOME,
+}
