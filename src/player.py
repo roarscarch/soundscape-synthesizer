@@ -1,187 +1,164 @@
 """
-Audio player: real-time playback, volume LFO, panning LFO, sleep timer, fade-out, and WAV export.
+Audio player module: handles real-time playback, panning, volume LFOs,
+sleep timer, and fade-out.
 """
 
 import numpy as np
 import sounddevice as sd
-import wave
 import threading
 import time
 from typing import Optional, Callable
 
 
 class AudioPlayer:
-    """Handles real-time audio playback with volume/pan LFOs, sleep timer, fade-out, and export."""
+    """Play audio streams with volume LFO, panning LFO, sleep timer, and fade-out."""
 
     def __init__(
         self,
         sample_rate: int = 44100,
-        channels: int = 2,
         blocksize: int = 1024,
-        volume_lfo_rate: float = 0.1,
-        volume_lfo_depth: float = 0.3,
-        pan_lfo_rate: float = 0.05,
-        pan_lfo_depth: float = 0.5,
+        channels: int = 2,
+        dtype: str = 'float32',
     ):
-        """
-        :param sample_rate: sample rate in Hz
-        :param channels: number of output channels (1 or 2)
-        :param blocksize: number of frames per callback
-        :param volume_lfo_rate: LFO rate for volume modulation (Hz)
-        :param volume_lfo_depth: depth of volume LFO (0..1)
-        :param pan_lfo_rate: LFO rate for pan modulation (Hz)
-        :param pan_lfo_depth: depth of pan LFO (0..1)
-        """
         self.sample_rate = sample_rate
-        self.channels = channels
         self.blocksize = blocksize
-        self.volume_lfo_rate = volume_lfo_rate
-        self.volume_lfo_depth = volume_lfo_depth
-        self.pan_lfo_rate = pan_lfo_rate
-        self.pan_lfo_depth = pan_lfo_depth
+        self.channels = channels
+        self.dtype = dtype
 
         self._stream: Optional[sd.OutputStream] = None
-        self._source_callback: Optional[Callable[[int], np.ndarray]] = None
         self._running = False
-        self._start_time: float = 0.0
-        self._sleep_duration: Optional[float] = None
-        self._fade_duration: float = 5.0
-        self._fade_start_time: Optional[float] = None
-        self._exporting = False
-        self._export_buffer: Optional[np.ndarray] = None
         self._lock = threading.Lock()
 
-    def set_source(self, callback: Callable[[int], np.ndarray]) -> None:
-        """Set the callback that generates audio frames.
+        # Volume and panning state
+        self.volume = 1.0
+        self.pan = 0.0  # -1 left, 0 center, 1 right
 
-        :param callback: function taking number of frames and returning (frames, channels) array
-        """
-        self._source_callback = callback
+        # LFO parameters
+        self.volume_lfo_rate: float = 0.0
+        self.volume_lfo_depth: float = 0.0
+        self.pan_lfo_rate: float = 0.0
+        self.pan_lfo_depth: float = 0.0
+
+        # Sleep timer
+        self.sleep_duration: float = 0.0  # seconds, 0 = disabled
+        self._sleep_start_time: float = 0.0
+        self._fade_duration: float = 5.0  # fade-out duration in seconds
+
+        # Callback to get audio data
+        self._audio_source: Optional[Callable[[int], np.ndarray]] = None
+
+        # Internal LFO phase accumulators
+        self._phase_vol = 0.0
+        self._phase_pan = 0.0
+
+    def set_audio_source(self, source: Callable[[int], np.ndarray]) -> None:
+        """Set a callable that returns a chunk of audio samples (n_samples,) or (n_samples, channels)."""
+        self._audio_source = source
 
     def start(self) -> None:
-        """Start playback."""
+        """Start audio playback."""
         if self._running:
             return
-        if self._source_callback is None:
-            raise RuntimeError("No source callback set. Call set_source() first.")
-
         self._running = True
-        self._start_time = time.time()
-        self._fade_start_time = None
-        self._export_buffer = None
-
+        self._sleep_start_time = time.time()
         self._stream = sd.OutputStream(
             samplerate=self.sample_rate,
-            channels=self.channels,
             blocksize=self.blocksize,
-            callback=self._audio_callback,
-            dtype=np.float32,
+            channels=self.channels,
+            dtype=self.dtype,
+            callback=self._callback,
         )
         self._stream.start()
 
     def stop(self) -> None:
-        """Stop playback."""
-        self._running = False
+        """Stop audio playback."""
+        with self._lock:
+            self._running = False
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
             self._stream = None
 
-    def set_sleep_timer(self, duration_seconds: float) -> None:
-        """Set a sleep timer: after duration_seconds, begin fade-out and stop.
+    def set_sleep_timer(self, duration_seconds: float, fade_duration: float = 5.0) -> None:
+        """Set a sleep timer: after duration_seconds, fade out and stop.
 
-        :param duration_seconds: playback duration before fade-out begins
+        :param duration_seconds: total playback time in seconds (0 = disabled)
+        :param fade_duration: duration of the fade-out in seconds
         """
-        self._sleep_duration = duration_seconds
+        self.sleep_duration = duration_seconds
+        self._fade_duration = fade_duration
+        if duration_seconds > 0:
+            self._sleep_start_time = time.time()
 
-    def set_fade_duration(self, duration_seconds: float) -> None:
-        """Set the duration of the fade-out (in seconds). Default 5.0."""
-        self._fade_duration = max(0.1, duration_seconds)
-
-    def start_export(self) -> None:
-        """Begin capturing audio to internal buffer for later export."""
-        self._exporting = True
-        self._export_buffer = np.zeros((0, self.channels), dtype=np.float32)
-
-    def stop_export(self, filepath: str) -> None:
-        """Stop capturing and write the internal buffer to a WAV file.
-
-        :param filepath: path to output .wav file
-        """
-        self._exporting = False
-        if self._export_buffer is None or len(self._export_buffer) == 0:
-            raise RuntimeError("No audio data captured. Call start_export() before playing.")
-
-        buffer = self._export_buffer
-        # Ensure float32, scale to int16
-        buffer = np.clip(buffer, -1.0, 1.0)
-        int_buffer = (buffer * 32767).astype(np.int16)
-
-        with wave.open(filepath, 'wb') as wf:
-            wf.setnchannels(self.channels)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(self.sample_rate)
-            wf.writeframes(int_buffer.tobytes())
-
-        print(f"Exported {len(buffer) / self.sample_rate:.1f}s to {filepath}")
-
-    def _audio_callback(self, outdata: np.ndarray, frames: int, time_info, status) -> None:
-        """Sounddevice callback: fill output buffer with processed audio."""
+    def _callback(self, outdata: np.ndarray, frames: int, time_info, status) -> None:
+        """Audio callback: fill outdata with processed audio."""
         if status:
             print(f"Audio callback status: {status}")
 
-        if not self._running:
-            outdata.fill(0)
-            return
+        with self._lock:
+            if not self._running or self._audio_source is None:
+                outdata.fill(0.0)
+                return
 
-        # Get source audio
-        audio = self._source_callback(frames)
-        if audio.ndim == 1:
-            audio = audio[:, np.newaxis]  # mono to 2D
-        if audio.shape[1] < self.channels:
-            # Duplicate mono to stereo
-            audio = np.repeat(audio, self.channels, axis=1)
-        elif audio.shape[1] > self.channels:
-            audio = audio[:, :self.channels]
+            # Get raw audio from source
+            raw = self._audio_source(frames)
+            if raw.ndim == 1:
+                raw = np.column_stack([raw, raw])  # mono to stereo
+            elif raw.shape[1] == 1:
+                raw = np.column_stack([raw[:, 0], raw[:, 0]])
 
-        # Apply volume LFO
-        elapsed = time.time() - self._start_time
-        lfo_phase = elapsed * self.volume_lfo_rate * 2 * np.pi
-        volume_mod = 1.0 - self.volume_lfo_depth * 0.5 * (1.0 + np.sin(lfo_phase))
-        audio *= volume_mod
+            # Ensure correct number of frames
+            if raw.shape[0] < frames:
+                raw = np.pad(raw, ((0, frames - raw.shape[0]), (0, 0)), mode='constant')
+            elif raw.shape[0] > frames:
+                raw = raw[:frames, :]
 
-        # Apply pan LFO (if stereo)
-        if self.channels == 2:
-            pan_phase = elapsed * self.pan_lfo_rate * 2 * np.pi
-            pan = 0.5 + self.pan_lfo_depth * 0.5 * np.sin(pan_phase)  # 0..1
-            audio[:, 0] *= (1.0 - pan) * 2.0  # left
-            audio[:, 1] *= pan * 2.0          # right
+            # Apply volume LFO
+            if self.volume_lfo_rate > 0 and self.volume_lfo_depth > 0:
+                self._phase_vol += self.volume_lfo_rate * frames / self.sample_rate
+                lfo_mod = 1.0 + self.volume_lfo_depth * np.sin(2 * np.pi * self._phase_vol)
+                raw *= lfo_mod[:, np.newaxis]
 
-        # Check sleep timer
-        if self._sleep_duration is not None:
-            if self._fade_start_time is None:
-                if elapsed >= self._sleep_duration:
-                    self._fade_start_time = elapsed
+            # Apply panning LFO
+            if self.pan_lfo_rate > 0 and self.pan_lfo_depth > 0:
+                self._phase_pan += self.pan_lfo_rate * frames / self.sample_rate
+                pan_mod = self.pan + self.pan_lfo_depth * np.sin(2 * np.pi * self._phase_pan)
+                left_gain = np.clip(0.5 * (1.0 - pan_mod), 0, 1)
+                right_gain = np.clip(0.5 * (1.0 + pan_mod), 0, 1)
+                raw[:, 0] *= left_gain
+                raw[:, 1] *= right_gain
             else:
-                fade_elapsed = elapsed - self._fade_start_time
-                if fade_elapsed >= self._fade_duration:
-                    # Fade complete, stop
-                    outdata.fill(0)
-                    self.stop()
+                # Static pan
+                left_gain = np.clip(0.5 * (1.0 - self.pan), 0, 1)
+                right_gain = np.clip(0.5 * (1.0 + self.pan), 0, 1)
+                raw[:, 0] *= left_gain
+                raw[:, 1] *= right_gain
+
+            # Apply volume
+            raw *= self.volume
+
+            # Sleep timer and fade-out
+            if self.sleep_duration > 0:
+                elapsed = time.time() - self._sleep_start_time
+                remaining = self.sleep_duration - elapsed
+                if remaining <= 0:
+                    # Fade-out finished or timer expired
+                    outdata.fill(0.0)
+                    self._running = False
                     return
-                fade_gain = 1.0 - (fade_elapsed / self._fade_duration)
-                audio *= fade_gain
+                elif remaining < self._fade_duration:
+                    fade_factor = remaining / self._fade_duration
+                    raw *= fade_factor
 
-        # Export capture
-        if self._exporting and self._export_buffer is not None:
-            with self._lock:
-                self._export_buffer = np.vstack([self._export_buffer, audio])
+            outdata[:] = raw.astype(self.dtype)
 
-        outdata[:] = audio[:frames, :]
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-    def __del__(self) -> None:
+    def close(self) -> None:
+        """Cleanly close the audio stream."""
         self.stop()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
