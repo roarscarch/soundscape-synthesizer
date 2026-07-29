@@ -1,8 +1,3 @@
-"""
-Command-line interface for Soundscape Synthesizer.
-Provides argument parsing and main entry point.
-"""
-
 import argparse
 import sys
 import signal
@@ -39,158 +34,160 @@ Examples:
         type=str,
         choices=list(BIOME_REGISTRY.keys()),
         default="forest",
-        help="Biome preset to use (default: 'forest')",
+        help=f"Biome preset (choices: {', '.join(BIOME_REGISTRY.keys())}, default: forest)",
     )
 
     parser.add_argument(
         "--duration",
-        type=int,
-        default=0,
+        type=float,
+        default=0.0,
         help="Duration in seconds (0 = infinite, default: 0)",
-    )
-
-    parser.add_argument(
-        "--sample-rate",
-        type=int,
-        default=44100,
-        help="Sample rate in Hz (default: 44100)",
     )
 
     parser.add_argument(
         "--export",
         type=str,
         default=None,
-        help="Export the generated soundscape to a WAV file at the given path",
+        help="Export soundscape to WAV file (e.g., output.wav)",
+    )
+
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=0.0,
+        help="Sleep timer in minutes (0 = disabled, default: 0)",
     )
 
     parser.add_argument(
         "--volume",
         type=float,
         default=0.5,
-        help="Master volume (0.0 to 1.0, default: 0.5)",
+        help="Initial volume (0.0 to 1.0, default: 0.5)",
     )
 
     parser.add_argument(
-        "--sleep-timer",
-        type=int,
-        default=0,
-        help="Sleep timer in minutes (0 = disabled, default: 0). After this many minutes, the soundscape will fade out and exit.",
+        "--list-biomes",
+        action="store_true",
+        help="List available biomes and exit",
     )
 
     parser.add_argument(
-        "--fade-duration",
-        type=int,
-        default=30,
-        help="Fade-out duration in seconds when sleep timer expires (default: 30)",
+        "--info",
+        action="store_true",
+        help="Display detailed info about the selected biome and exit",
     )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
 
+    # Validate seed: must be non-empty string
+    if not args.seed or not args.seed.strip():
+        parser.error("Seed phrase cannot be empty.")
 
-def main(argv: Optional[list] = None) -> None:
-    """Main entry point for the soundscape synthesizer."""
-    args = parse_args(argv)
-
-    # Validate arguments
+    # Validate volume range
     if args.volume < 0.0 or args.volume > 1.0:
-        print("Error: --volume must be between 0.0 and 1.0", file=sys.stderr)
+        parser.error("Volume must be between 0.0 and 1.0.")
+
+    # Validate duration
+    if args.duration < 0:
+        parser.error("Duration must be non-negative.")
+
+    # Validate sleep
+    if args.sleep < 0:
+        parser.error("Sleep timer must be non-negative.")
+
+    return args
+
+
+def list_biomes() -> None:
+    """Print available biomes."""
+    print("Available biomes:")
+    for name, biome in BIOME_REGISTRY.items():
+        print(f"  {name}: {biome.name}")
+        print(f"    base frequencies: {biome.base_frequencies}")
+        print(f"    harmonics: {list(biome.harmonics)}")
+        print(f"    grain duration: {biome.grain_duration}s")
+        print()
+
+
+def show_biome_info(biome_name: str) -> None:
+    """Display detailed info about a specific biome."""
+    biome = BIOME_REGISTRY.get(biome_name)
+    if not biome:
+        print(f"Error: Biome '{biome_name}' not found.")
+        sys.exit(1)
+    print(f"Biome: {biome.name}")
+    print(f"  Base frequencies: {biome.base_frequencies}")
+    print(f"  Harmonics: {list(biome.harmonics)}")
+    print(f"  Envelope attack: {biome.envelope_attack}s")
+    print(f"  Envelope decay: {biome.envelope_decay}s")
+    print(f"  Grain duration: {biome.grain_duration}s")
+    print(f"  Sample rate: {biome.sample_rate} Hz")
+    print(f"  Seed: {biome.seed if biome.seed else 'None (default)'}")
+
+
+def main() -> None:
+    """Main entry point for the soundscape synthesizer."""
+    args = parse_args()
+
+    # Handle special flags
+    if args.list_biomes:
+        list_biomes()
+        return
+
+    if args.info:
+        show_biome_info(args.biome)
+        return
+
+    # Get biome
+    biome = BIOME_REGISTRY.get(args.biome)
+    if not biome:
+        print(f"Error: Biome '{args.biome}' not found.")
         sys.exit(1)
 
-    if args.sleep_timer < 0:
-        print("Error: --sleep-timer must be a non-negative integer", file=sys.stderr)
-        sys.exit(1)
-
-    if args.fade_duration < 0:
-        print("Error: --fade-duration must be a non-negative integer", file=sys.stderr)
-        sys.exit(1)
-
-    # Resolve biome
-    if args.biome not in BIOME_REGISTRY:
-        print(f"Error: Unknown biome '{args.biome}'. Available biomes: {list(BIOME_REGISTRY.keys())}", file=sys.stderr)
-        sys.exit(1)
-
-    biome = BIOME_REGISTRY[args.biome]
-
-    # Create engine and player
-    engine = SoundscapeEngine(
-        biome=biome,
-        sample_rate=args.sample_rate,
-        seed=args.seed,
-    )
-
-    player = AudioPlayer(
-        engine=engine,
-        sample_rate=args.sample_rate,
-        seed=args.seed,
-    )
-
-    # Handle graceful shutdown
-    running = [True]
-
-    def signal_handler(sig, frame):
-        print("\nShutting down...")
-        running[0] = False
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # If sleep timer is set, schedule fade-out
-    fade_start_time = None
-    if args.sleep_timer > 0:
-        fade_start_time = time.time() + args.sleep_timer * 60
-        print(f"Sleep timer set for {args.sleep_timer} minute(s). Fade-out duration: {args.fade_duration}s")
-
-    # Start playback
-    print(f"Starting soundscape: seed='{args.seed}', biome='{args.biome}', volume={args.volume}")
+    print(f"Starting soundscape with seed: '{args.seed}'")
+    print(f"Biome: {biome.name}")
+    print(f"Volume: {args.volume}")
     if args.duration > 0:
         print(f"Duration: {args.duration}s")
     else:
-        print("Duration: infinite (press Ctrl+C to stop)")
-
-    player.start(volume=args.volume)
-
-    try:
-        start_time = time.time()
-        while running[0]:
-            elapsed = time.time() - start_time
-
-            # Check duration limit
-            if args.duration > 0 and elapsed >= args.duration:
-                print(f"\nDuration limit reached ({args.duration}s).")
-                break
-
-            # Check sleep timer
-            if fade_start_time is not None:
-                remaining = fade_start_time - time.time()
-                if remaining <= 0:
-                    # Begin fade-out
-                    print(f"\nSleep timer expired. Fading out over {args.fade_duration}s...")
-                    player.fade_out(duration=args.fade_duration)
-                    # Wait for fade-out to complete
-                    time.sleep(args.fade_duration + 0.5)
-                    break
-                elif remaining <= 5.0:
-                    # Warn user
-                    print(f"\nSleep timer ending in {int(remaining)} seconds...")
-
-            # Sleep a bit to avoid busy-waiting
-            time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-    finally:
-        player.stop()
-
-    # Export if requested
+        print("Duration: infinite")
+    if args.sleep > 0:
+        print(f"Sleep timer: {args.sleep} minutes")
     if args.export:
-        print(f"Exporting soundscape to '{args.export}'...")
+        print(f"Export to: {args.export}")
+    print()
+
+    # Initialize engine and player
+    try:
+        from .grain_bank import GrainBank
+        grain_bank = GrainBank(
+            biome=biome,
+            seed=args.seed,
+        )
+        engine = SoundscapeEngine(
+            seed=args.seed,
+            grain_bank=grain_bank,
+        )
+        player = AudioPlayer(
+            engine=engine,
+            sample_rate=biome.sample_rate,
+            volume=args.volume,
+        )
+    except Exception as e:
+        print(f"Error initializing audio system: {e}")
+        sys.exit(1)
+
+    # Handle sleep timer
+    sleep_seconds = args.sleep * 60.0
+    if sleep_seconds > 0:
+        fade_duration = 5.0  # 5 seconds fade-out
+        player.set_sleep_timer(sleep_seconds, fade_duration)
+
+    # Handle export
+    if args.export:
         try:
-            player.export_wav(args.export)
-            print("Export complete.")
+            player.export_to_wav(args.export, duration=args.duration if args.duration > 0 else 60.0)
+            print(f"Exported soundscape to {args.export}")
+            return
         except Exception as e:
-            print(f"Export failed: {e}", file=sys.stderr)
-            sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+            print(f"Error exporting soundscape: {e}
