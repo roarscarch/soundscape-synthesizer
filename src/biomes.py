@@ -21,6 +21,9 @@ class Biome:
         grain_duration: float,
         sample_rate: int = 44100,
         seed: Optional[str] = None,
+        pan_spread: float = 0.5,
+        volume_lfo_rate: float = 0.1,
+        pan_lfo_rate: float = 0.05,
     ):
         """
         :param name: human-readable biome name
@@ -31,6 +34,9 @@ class Biome:
         :param grain_duration: duration of each grain in seconds
         :param sample_rate: sample rate in Hz
         :param seed: optional seed string for deterministic wave table variation
+        :param pan_spread: stereo spread factor (0.0 = mono, 1.0 = full stereo)
+        :param volume_lfo_rate: rate of volume LFO in Hz
+        :param pan_lfo_rate: rate of pan LFO in Hz
         """
         self.name = name
         self.base_frequencies = base_frequencies
@@ -39,115 +45,87 @@ class Biome:
         self.envelope_decay = envelope_decay
         self.grain_duration = grain_duration
         self.sample_rate = sample_rate
-        self.seed = seed or name
+        self.pan_spread = pan_spread
+        self.volume_lfo_rate = volume_lfo_rate
+        self.pan_lfo_rate = pan_lfo_rate
 
-        # Precompute wave table as a list of numpy arrays
-        self.wave_table = self._build_wave_table()
+        # Deterministic seed for wave table variation
+        if seed is not None:
+            digest = sha256(seed.encode()).hexdigest()
+            self._seed_int = int(digest[:8], 16)
+        else:
+            self._seed_int = 0
+
+        # Generate wave table (list of waveforms) on init
+        self.wave_table: List[np.ndarray] = self._build_wave_table()
 
     def _build_wave_table(self) -> List[np.ndarray]:
         """
-        Build the wave table: for each base frequency, generate a waveform
-        by summing harmonics with the given amplitudes, then apply an envelope.
-        Returns a list of 1D numpy arrays (float32).
+        Build a set of waveforms based on base frequencies and harmonics.
+        Each waveform is a single period normalized to [-1, 1].
         """
-        table = []
-        num_harmonics = len(self.harmonics)
+        rng = np.random.default_rng(self._seed_int)
+        table: List[np.ndarray] = []
         for freq in self.base_frequencies:
-            # Generate one period of the waveform
-            period = int(self.sample_rate / freq)
-            t = np.linspace(0, 2 * np.pi, period, endpoint=False, dtype=np.float32)
-            waveform = np.zeros(period, dtype=np.float32)
-            for i, amp in enumerate(self.harmonics):
-                harmonic_freq = freq * (i + 1)
-                waveform += amp * np.sin(harmonic_freq * t / freq)  # t already scaled to 2pi per fundamental period
-            # Normalize to prevent clipping
-            max_amp = np.max(np.abs(waveform))
-            if max_amp > 0:
-                waveform /= max_amp
-            table.append(waveform)
+            # Number of samples for one period at this frequency
+            period_samples = max(2, int(self.sample_rate / freq))
+            t = np.linspace(0.0, 1.0, period_samples, endpoint=False)
+            # Start with sine wave
+            wave = np.sin(2.0 * np.pi * t)
+            # Add harmonics with slight random detuning for organic feel
+            for idx, amp in enumerate(self.harmonics):
+                if idx == 0:
+                    continue  # fundamental already added
+                harmonic_freq = (idx + 1.0) * 1.0
+                # Small detune factor (max 2%)
+                detune = 1.0 + (rng.random() - 0.5) * 0.04
+                phase_shift = rng.random() * 2.0 * np.pi
+                harmonic = np.sin(2.0 * np.pi * harmonic_freq * detune * t + phase_shift)
+                wave += amp * harmonic
+            # Normalize to [-1, 1]
+            max_abs = np.max(np.abs(wave))
+            if max_abs > 0:
+                wave = wave / max_abs
+            table.append(wave.astype(np.float32))
         return table
 
-    def get_grain_waveform(self, grain_index: int, duration_seconds: float) -> np.ndarray:
+    def get_grain_envelope(self) -> np.ndarray:
         """
-        Return a waveform for a given grain index, tiling the wave table as needed.
-        The grain_index determines which base waveform to use (modulo table size).
-        Duration is in seconds; the returned array length = sample_rate * duration.
+        Return an amplitude envelope for a grain of duration grain_duration.
+        Uses linear attack and decay.
         """
-        num_bases = len(self.wave_table)
-        if num_bases == 0:
-            return np.zeros(int(self.sample_rate * duration_seconds), dtype=np.float32)
-        base_idx = grain_index % num_bases
-        base_wave = self.wave_table[base_idx]
-        # Tile to desired duration
-        num_samples = int(self.sample_rate * duration_seconds)
-        repeats = (num_samples // len(base_wave)) + 1
-        tiled = np.tile(base_wave, repeats)[:num_samples]
-        # Apply envelope
-        envelope = self._envelope(num_samples)
-        return (tiled * envelope).astype(np.float32)
-
-    def _envelope(self, num_samples: int) -> np.ndarray:
-        """
-        Generate an amplitude envelope: linear attack, then exponential decay.
-        """
+        total_samples = int(self.grain_duration * self.sample_rate)
         attack_samples = int(self.envelope_attack * self.sample_rate)
         decay_samples = int(self.envelope_decay * self.sample_rate)
-        if attack_samples + decay_samples > num_samples:
-            # Short grain: scale envelope to fit
-            attack_samples = num_samples // 2
-            decay_samples = num_samples - attack_samples
-        env = np.ones(num_samples, dtype=np.float32)
-        if attack_samples > 0:
-            env[:attack_samples] = np.linspace(0.0, 1.0, attack_samples, dtype=np.float32)
-        if decay_samples > 0:
-            decay_curve = np.exp(-np.linspace(0, 4, decay_samples, dtype=np.float32))
-            env[-decay_samples:] = decay_curve
-        return env
+        sustain_samples = total_samples - attack_samples - decay_samples
+        if sustain_samples < 0:
+            sustain_samples = 0
+            attack_samples = total_samples // 2
+            decay_samples = total_samples - attack_samples
 
-    def __repr__(self) -> str:
-        return f"Biome('{self.name}', {len(self.base_frequencies)} frequencies, {len(self.harmonics)} harmonics)"
+        attack_ramp = np.linspace(0.0, 1.0, attack_samples, dtype=np.float32)
+        sustain = np.ones(sustain_samples, dtype=np.float32)
+        decay_ramp = np.linspace(1.0, 0.0, decay_samples, dtype=np.float32)
+        envelope = np.concatenate([attack_ramp, sustain, decay_ramp])
+        # Ensure length matches total_samples (due to rounding)
+        if len(envelope) < total_samples:
+            envelope = np.pad(envelope, (0, total_samples - len(envelope)), mode='constant', constant_values=0.0)
+        elif len(envelope) > total_samples:
+            envelope = envelope[:total_samples]
+        return envelope
 
-
-# ---------------------------------------------------------------------------
-# Preset biome instances
-# ---------------------------------------------------------------------------
-
-FOREST_BIOME = Biome(
-    name="forest",
-    base_frequencies=[80, 120, 180, 240, 360],
-    harmonics=[1.0, 0.6, 0.3, 0.15, 0.05],
-    envelope_attack=0.1,
-    envelope_decay=0.8,
-    grain_duration=1.0,
-    sample_rate=44100,
-    seed="forest_preset",
-)
-
-OCEAN_BIOME = Biome(
-    name="ocean",
-    base_frequencies=[40, 60, 90, 130, 200],
-    harmonics=[1.0, 0.4, 0.2, 0.1, 0.02],
-    envelope_attack=0.05,
-    envelope_decay=1.5,
-    grain_duration=2.0,
-    sample_rate=44100,
-    seed="ocean_preset",
-)
-
-SPACE_BIOME = Biome(
-    name="space",
-    base_frequencies=[30, 50, 70, 100, 150],
-    harmonics=[1.0, 0.8, 0.6, 0.4, 0.2],
-    envelope_attack=0.2,
-    envelope_decay=2.0,
-    grain_duration=3.0,
-    sample_rate=44100,
-    seed="space_preset",
-)
-
-# Registry for easy lookup by name
-BIOME_REGISTRY: Dict[str, Biome] = {
-    "forest": FOREST_BIOME,
-    "ocean": OCEAN_BIOME,
-    "space": SPACE_BIOME,
-}
+    def get_parameters(self) -> dict:
+        """Return biome parameters as a dictionary for easy access."""
+        return {
+            'name': self.name,
+            'base_frequencies': self.base_frequencies,
+            'harmonics': self.harmonics.tolist(),
+            'envelope_attack': self.envelope_attack,
+            'envelope_decay': self.envelope_decay,
+            'grain_duration': self.grain_duration,
+            'sample_rate': self.sample_rate,
+            'pan_spread': self.pan_spread,
+            'volume_lfo_rate': self.volume_lfo_rate,
+            'pan_lfo_rate': self.pan_lfo_rate,
+            'wave_table_lengths': [len(w) for w in self.wave_table],
+        }
