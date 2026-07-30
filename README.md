@@ -16,3 +16,4 @@ python src/main.py --seed "ocean waves"
 - Ocean (waves, distant storms)
 - Space (low drones, occasional events)
 - Custom: drop your own wavetables in `samples/`
+
