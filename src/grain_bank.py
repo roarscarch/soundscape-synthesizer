@@ -1,1 +1,98 @@
-"""\nGrainBank: manages a pool of audio grains derived from a biome's wave table.\nProvides seed-based selection and interpolation for deterministic, non-repeating output.\n"""\n\nimport numpy as np\nfrom hashlib import sha256\nfrom typing import List, Tuple, Optional\n\nfrom .engine import seed_to_int, Grain\n\n\ndef generate_grain_waveform(\n    base_freq: float,\n    harmonics: np.ndarray,\n    duration: float,\n    sample_rate: int = 44100,\n) -> np.ndarray:\n    """Generate a waveform by summing harmonics with given amplitudes.\n\n    :param base_freq: fundamental frequency in Hz\n    :param harmonics: array of amplitude multipliers for harmonic series (1.0, 0.5, 0.25, ...)\n    :param duration: length in seconds\n    :param sample_rate: sample rate in Hz\n    :return: 1D float32 array normalized to [-1, 1]\n    """\n    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False, dtype=np.float32)\n    waveform = np.zeros_like(t)\n    for i, amp in enumerate(harmonics):\n        if amp == 0.0:\n            continue\n        freq = base_freq * (i + 1)\n        waveform += amp * np.sin(2 * np.pi * freq * t)\n    # Normalize to prevent clipping\n    max_val = np.max(np.abs(waveform))\n    if max_val > 0:\n        waveform /= max_val\n    return waveform\n\n\ndef apply_envelope(\n    waveform: np.ndarray,\n    attack: float,\n    decay: float,\n    sample_rate: int = 44100,\n) -> np.ndarray:\n    """Apply attack and decay envelope to waveform.\n\n    :param waveform: 1D audio array\n    :param attack: attack time in seconds\n    :param decay: decay time in seconds\n    :param sample_rate: sample rate in Hz\n    :return: envelope-shaped waveform\n    """\n    length = len(waveform)\n    attack_samples = min(int(attack * sample_rate), length // 2)\n    decay_samples = min(int(decay * sample_rate), length // 2)\n    envelope = np.ones(length, dtype=np.float32)\n    if attack_samples > 0:\n        envelope[:attack_samples] = np.linspace(0.0, 1.0, attack_samples, dtype=np.float32)\n    if decay_samples > 0:\n        envelope[-decay_samples:] = np.linspace(1.0, 0.0, decay_samples, dtype=np.float32)\n    return waveform * envelope\n\n\nclass GrainBank:\n    """A pool of grains generated from a biome definition.\n\n    Provides methods to retrieve grains by frequency bin or by randomized selection\n    driven by the seed phrase, ensuring deterministic but non-repeating output.\n    """\n\n    def __init__(\n        self,\n        base_frequencies: List[float],\n        harmonics: np.ndarray,\n        envelope_attack: float,\n        envelope_decay: float,\n        grain_duration: float,\n        sample_rate: int = 44100,\n        seed: Optional[str] = None,\n    ):\n        """\n        Initialize the grain bank by pre-computing one waveform per base frequency.\n\n        :param base_frequencies: list of fundamental frequencies\n        :param harmonics: amplitude multipliers for harmonic series\n        :param envelope_attack: attack time in seconds\n        :param envelope_decay: decay time in seconds\n        :param grain_duration: duration of each grain in seconds\n        :param sample_rate: sample rate in Hz\n        :param seed: optional seed string for deterministic pseudo-random selection\n        """\n        self.base_frequencies = base_frequencies\n        self.harmonics = harmonics.astype(np.float32)\n        self.envelope_attack = envelope_attack\n        self.envelope_decay = envelope_decay\n        self.grain_duration = grain_duration\n        self.sample_rate = sample_rate\n        self.seed = seed or str(hash(tuple(base_frequencies)))\n        self._rng = np.random.default_rng(seed_to_int(self.seed))\n\n        # Pre-generate one grain per frequency bin\n        self._grains: List[Grain] = []\n        for idx, freq in enumerate(base_frequencies):\n            wav = generate_grain_waveform(freq, harmonics, grain_duration, sample_rate)\n            wav = apply_envelope(wav, envelope_attack, envelope_decay, sample_rate)\n            # Random amplitude variation based on seed\n            amp = 0.5 + 0.5 * self._rng.random()\n            grain = Grain(waveform=wav, freq_bin=idx, amplitude=amp)\n            self._grains.append(grain)\n\n        # Internal selection state for deterministic non-repeating sequence\n        self._selection_index = 0\n        self._permutation = self._rng.permutation(len(self._grains)).tolist()\n\n    @property\n    def num_grains(self) -> int:\n        return len(self._grains)\n\n    def get_grain(self, index: int) -> Grain:\n        """Return the grain at the given index (0..num_grains-1).\n\n        Raises IndexError if out of range.\n        """\n        return self._grains[index]\n\n    def next_grain(self) -> Grain:\n        """Return the next grain in the deterministic cyclic permutation.\n\n        This ensures each grain is played once before repeating, but in a seeded random order.\n        """\n        idx = self._permutation[self._selection_index % len(self._permutation)]\n        self._selection_index += 1\n        grain = self._grains[idx]\n        # Add slight amplitude modulation per playback for organic feel\n        # (the base amplitude is fixed, but we return the original grain)\n        return grain\n\n    def reset_sequence(self) -> None:\n        """Reset the selection sequence to the beginning (useful for restarting)."""\n        self._selection_index = 0\n        self._permutation = self._rng.permutation(len(self._grains)).tolist()\n\n    def get_grain_for_freq_bin(self, freq_bin: int) -> Grain:\n        """Return the grain corresponding to a specific frequency bin index.\n\n        Falls back to nearest valid index if out of range.\n        """\n        idx = max(0, min(freq_bin, len(self._grains) - 1))\n        return self._grains[idx]\n\n    def interpolate_grains(self, freq_bin_a: int, freq_bin_b: int, mix: float) -> np.ndarray:\n        """Return a waveform that is a linear interpolation between two grains' waveforms.\n\n        :param freq_bin_a: index of first grain\n        :param freq_bin_b: index of second grain\n        :param mix: blend factor (0.0 = all A, 1.0 = all B)\n        :return: interpolated waveform as 1D float32 array\n        """\n        grain_a = self.get_grain_for_freq_bin(freq_bin_a)\n        grain_b = self.get_grain_for_freq_bin(freq_bin_b)\n        wav_a = grain_a.waveform * grain_a.amplitude\n        wav_b = grain_b.waveform * grain_b.amplitude\n        # Ensure same length (should be, but guard)\n        min_len = min(len(wav_a), len(wav_b))\n        return (1.0 - mix) * wav_a[:min_len] + mix * wav_b[:min_len]\n\n\ndef create_grain_bank_from_biome(biome, seed: str) -> GrainBank:\
+"""
+Grain bank: stores and selects audio grains deterministically from wave tables.
+Each grain is a short audio snippet shaped by an envelope.
+"""
+
+import numpy as np
+from typing import List, Optional
+from hashlib import sha256
+
+
+class GrainBank:
+    """Manages a collection of grains derived from a biome's wave table."""
+
+    def __init__(
+        self,
+        wave_table: np.ndarray,
+        sample_rate: int = 44100,
+        grain_duration: float = 0.1,
+        seed: Optional[str] = None,
+    ):
+        """
+        :param wave_table: 2D array of shape (num_waves, num_samples) containing base waveforms
+        :param sample_rate: sample rate in Hz
+        :param grain_duration: duration of each grain in seconds
+        :param seed: optional seed string for deterministic grain ordering
+        """
+        if wave_table.ndim != 2:
+            raise ValueError(f"wave_table must be 2D, got shape {wave_table.shape}")
+        if wave_table.shape[0] == 0:
+            raise ValueError("wave_table must contain at least one waveform")
+        if grain_duration <= 0:
+            raise ValueError("grain_duration must be positive")
+
+        self.wave_table = wave_table.astype(np.float64)
+        self.sample_rate = sample_rate
+        self.grain_duration = grain_duration
+        self.grain_length = int(sample_rate * grain_duration)
+
+        # Seeded PRNG for deterministic grain selection
+        if seed is None:
+            seed = ""
+        seed_bytes = seed.encode("utf-8")
+        hash_digest = sha256(seed_bytes).digest()
+        # Use first 4 bytes as seed for numpy's PCG64
+        self._rng = np.random.Generator(np.random.PCG64(np.frombuffer(hash_digest[:8], dtype=np.uint64)[0]))
+
+        # Precompute grains: for each waveform, generate a grain of length grain_length
+        self.grains: List[np.ndarray] = []
+        for wave in self.wave_table:
+            grain = self._generate_grain(wave)
+            self.grains.append(grain)
+
+        # Shuffle grains deterministically
+        self._indices = list(range(len(self.grains)))
+        self._rng.shuffle(self._indices)
+        self._index = 0
+
+    def _generate_grain(self, waveform: np.ndarray) -> np.ndarray:
+        """Generate a single grain by truncating or looping the waveform and applying an envelope."""
+        # Repeat waveform to fill grain_length if needed
+        repeats = int(np.ceil(self.grain_length / len(waveform)))
+        tiled = np.tile(waveform, repeats)[:self.grain_length]
+        # Apply a smooth attack-decay envelope (raised cosine)
+        envelope = np.ones(self.grain_length)
+        attack_len = min(int(self.sample_rate * 0.01), self.grain_length // 2)
+        decay_len = min(int(self.sample_rate * 0.03), self.grain_length // 2)
+        if attack_len > 0:
+            envelope[:attack_len] = 0.5 * (1 - np.cos(np.linspace(0, np.pi, attack_len)))
+        if decay_len > 0:
+            envelope[-decay_len:] = 0.5 * (1 + np.cos(np.linspace(0, np.pi, decay_len)))
+        return tiled * envelope
+
+    def next_grain(self) -> np.ndarray:
+        """Return the next grain in deterministic sequence. Cycles indefinitely."""
+        idx = self._indices[self._index % len(self._indices)]
+        self._index += 1
+        return self.grains[idx].copy()
+
+    def reset(self) -> None:
+        """Reset the grain sequence to the beginning (deterministic replay)."""
+        self._index = 0
+
+    def interpolate_grain(self, t: float) -> np.ndarray:
+        """
+        Return a grain that is a linear interpolation between two adjacent grains
+        based on a continuous parameter t in [0, 1). This allows smooth transitions.
+        """
+        if not self.grains:
+            raise RuntimeError("No grains available")
+        # Map t to a floating index
+        max_idx = len(self.grains) - 1
+        float_idx = t * len(self.grains)
+        idx0 = int(float_idx) % len(self.grains)
+        idx1 = (idx0 + 1) % len(self.grains)
+        frac = float_idx - int(float_idx)
+        grain0 = self.grains[idx0]
+        grain1 = self.grains[idx1]
+        return (1.0 - frac) * grain0 + frac * grain1
