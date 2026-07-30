@@ -1,87 +1,57 @@
-"""Export soundscape audio stream to WAV file."""
+"""
+Export soundscape as WAV file.
+"""
 
 import numpy as np
 import wave
 import struct
+from pathlib import Path
 from typing import Optional
 
 
-def export_to_wav(
+def export_wav(
     audio: np.ndarray,
     filepath: str,
     sample_rate: int = 44100,
-    duration: Optional[float] = None,
+    max_duration: Optional[float] = None,
 ) -> None:
     """
-    Export a numpy audio array to a WAV file.
+    Export a stereo audio array to a WAV file.
 
-    :param audio: 2D numpy array of shape (num_samples, num_channels)
-    :param filepath: output .wav file path
+    :param audio: numpy array of shape (num_samples, 2) for stereo
+    :param filepath: output file path
     :param sample_rate: sample rate in Hz
-    :param duration: if given, truncate audio to this many seconds
+    :param max_duration: optional maximum duration in seconds
     """
+    audio = np.asarray(audio, dtype=np.float32)
+
     if audio.ndim == 1:
-        audio = audio[:, np.newaxis]
+        audio = np.column_stack((audio, audio))
+    elif audio.ndim == 2 and audio.shape[1] == 1:
+        audio = np.hstack((audio, audio))
+    elif audio.ndim != 2 or audio.shape[1] != 2:
+        raise ValueError("Audio must be mono or stereo (shape (N, 2))")
 
-    num_samples, num_channels = audio.shape
-
-    if duration is not None:
-        max_samples = int(duration * sample_rate)
-        if num_samples > max_samples:
+    if max_duration is not None:
+        max_samples = int(max_duration * sample_rate)
+        if audio.shape[0] > max_samples:
             audio = audio[:max_samples, :]
-            num_samples = max_samples
 
-    # Normalize to 16-bit PCM range
+    # Normalize to prevent clipping
     max_val = np.max(np.abs(audio))
     if max_val > 0:
         audio = audio / max_val
-    audio_int16 = np.int16(audio * 32767)
 
-    with wave.open(filepath, 'wb') as wf:
-        wf.setnchannels(num_channels)
+    # Convert to 16-bit PCM
+    audio_int16 = (audio * 32767).astype(np.int16)
+
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    with wave.open(str(filepath), "w") as wf:
+        wf.setnchannels(2)
         wf.setsampwidth(2)  # 16-bit
         wf.setframerate(sample_rate)
         wf.writeframes(audio_int16.tobytes())
 
-
-def export_soundscape(
-    engine,
-    filepath: str,
-    duration: Optional[float] = None,
-    sample_rate: int = 44100,
-) -> None:
-    """
-    Generate soundscape from engine and export as WAV.
-
-    :param engine: SoundscapeEngine instance (must have generate_block method)
-    :param filepath: output .wav file path
-    :param duration: length of audio to generate (None = use engine default)
-    :param sample_rate: sample rate in Hz
-    """
-    import time
-
-    if duration is None:
-        duration = 30.0  # default 30 seconds
-
-    block_size = int(sample_rate * 0.1)  # 100ms blocks
-    total_samples = int(duration * sample_rate)
-    num_channels = 2  # stereo
-
-    audio_buffer = np.zeros((total_samples, num_channels), dtype=np.float64)
-    samples_written = 0
-
-    while samples_written < total_samples:
-        remaining = total_samples - samples_written
-        this_block = min(block_size, remaining)
-        block = engine.generate_block(this_block)
-        if block is None:
-            break
-        if isinstance(block, np.ndarray) and block.ndim == 1:
-            block = block[:, np.newaxis]
-        if block.shape[1] < num_channels:
-            # Mono to stereo
-            block = np.tile(block, (1, num_channels))
-        audio_buffer[samples_written:samples_written + this_block, :] = block[:this_block, :]
-        samples_written += this_block
-
-    export_to_wav(audio_buffer[:samples_written, :], filepath, sample_rate)
+    print(f"Exported soundscape to {filepath}
