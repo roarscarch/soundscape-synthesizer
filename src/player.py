@@ -1,106 +1,136 @@
-import time
-import threading
+"""
+Audio player with real-time streaming, sleep timer, and fade-out.
+"""
+
+import asyncio
+import logging
 import numpy as np
 import sounddevice as sd
+import time
 from typing import Optional, Callable
 
-from .engine import SoundscapeEngine
 from .lfo import LFO
-from .meter import AudioLevelMeter
+from .meter import AudioMeter
+
+logger = logging.getLogger(__name__)
 
 
 class AudioPlayer:
-    """Plays audio from a SoundscapeEngine with real-time LFO modulation and optional meter."""
+    """Manages audio output stream with LFO processing, sleep timer, and fade-out."""
 
     def __init__(
         self,
-        engine: SoundscapeEngine,
         sample_rate: int = 44100,
         blocksize: int = 1024,
-        volume_lfo_rate: float = 0.1,
-        volume_lfo_depth: float = 0.3,
-        pan_lfo_rate: float = 0.05,
-        pan_lfo_depth: float = 0.4,
-        meter: Optional[AudioLevelMeter] = None,
+        channels: int = 2,
+        meter: Optional[AudioMeter] = None,
+        sleep_timer: float = 0.0,
+        fade_duration: float = 5.0,
     ):
-        self.engine = engine
+        """
+        :param sample_rate: sample rate in Hz
+        :param blocksize: number of frames per callback
+        :param channels: number of audio channels (default 2 for stereo)
+        :param meter: optional AudioMeter instance for level monitoring
+        :param sleep_timer: duration in seconds after which player auto-stops (0 = no timer)
+        :param fade_duration: duration of fade-out in seconds
+        """
         self.sample_rate = sample_rate
         self.blocksize = blocksize
-        self.volume_lfo = LFO(rate=volume_lfo_rate, depth=volume_lfo_depth, waveform='sine')
-        self.pan_lfo = LFO(rate=pan_lfo_rate, depth=pan_lfo_depth, waveform='sine')
+        self.channels = channels
         self.meter = meter
-        self._stream: Optional[sd.OutputStream] = None
-        self._running = False
-        self._stop_event = threading.Event()
+        self.sleep_timer = sleep_timer
+        self.fade_duration = fade_duration
 
-    def start(self):
-        """Start audio playback in a background thread."""
-        if self._running:
+        self.stream: Optional[sd.OutputStream] = None
+        self.is_playing = False
+        self.callback_fn: Optional[Callable[[int], np.ndarray]] = None
+
+        # LFOs for organic movement
+        self.volume_lfo = LFO(rate=0.1, min_val=0.6, max_val=1.0, waveform='sine')
+        self.pan_lfo = LFO(rate=0.05, min_val=-1.0, max_val=1.0, waveform='sine')
+
+        # Fade state
+        self._fade_start_time: Optional[float] = None
+        self._fade_start_volume: float = 1.0
+        self._player_start_time: Optional[float] = None
+
+        self._stop_event = asyncio.Event()
+
+    def set_callback(self, callback: Callable[[int], np.ndarray]):
+        """Set the audio generation callback."""
+        self.callback_fn = callback
+
+    def _audio_callback(self, outdata: np.ndarray, frames: int, time_info, status):
+        """Callback for sounddevice stream."""
+        if status:
+            logger.warning(f"Audio callback status: {status}")
+
+        if self.callback_fn is None:
+            outdata.fill(0)
             return
-        self._running = True
-        self._stop_event.clear()
-        self._stream = sd.OutputStream(
+
+        # Generate audio block
+        audio = self.callback_fn(frames)
+        if audio.ndim == 1:
+            audio = np.column_stack((audio, audio))  # mono to stereo
+
+        # Apply volume LFO
+        vol = self.volume_lfo.next()
+        audio = audio * vol
+
+        # Apply pan LFO
+        pan = self.pan_lfo.next()
+        left_gain = np.sqrt(0.5 * (1 - pan))
+        right_gain = np.sqrt(0.5 * (1 + pan))
+        audio[:, 0] *= left_gain
+        audio[:, 1] *= right_gain
+
+        # Apply fade-out if active
+        if self._fade_start_time is not None:
+            elapsed = time.time() - self._fade_start_time
+            if elapsed >= self.fade_duration:
+                audio.fill(0)
+                self._stop_event.set()
+            else:
+                fade_factor = 1.0 - (elapsed / self.fade_duration)
+                audio *= fade_factor
+
+        # Update meter
+        if self.meter is not None:
+            self.meter.update(audio)
+
+        outdata[:] = audio[:frames]
+
+    async def start(self):
+        """Start audio playback asynchronously."""
+        if self.is_playing:
+            logger.warning("Player already running")
+            return
+
+        self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
-            channels=2,
             blocksize=self.blocksize,
+            channels=self.channels,
             callback=self._audio_callback,
             dtype='float32',
         )
-        self._stream.start()
+        self.stream.start()
+        self.is_playing = True
+        self._player_start_time = time.time()
+        logger.info("Audio player started")
 
-    def stop(self):
-        """Stop audio playback gracefully."""
-        self._running = False
-        self._stop_event.set()
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        # Wait for stop event or sleep timer
+        if self.sleep_timer > 0:
+            await asyncio.sleep(self.sleep_timer)
+            await self.fade_out()
 
-    def _audio_callback(self, outdata: np.ndarray, frames: int, time_info, status):
-        if status:
-            print(f"Audio callback status: {status}")
-        if self._stop_event.is_set():
-            outdata.fill(0)
-            return
+        await self._stop_event.wait()
+        await self.stop()
 
-        # Generate stereo block from engine
-        block = self.engine.generate_block(frames)
-        if block is None:
-            outdata.fill(0)
-            return
-
-        # Apply volume LFO (gain modulation)
-        vol_mod = self.volume_lfo.get_value()
-        # vol_mod is in [-1, 1], map to [1 - depth, 1]
-        vol_gain = 1.0 - (self.volume_lfo.depth * (1.0 - vol_mod)) / 2.0
-        block *= vol_gain
-
-        # Apply pan LFO (balance between left and right)
-        pan_mod = self.pan_lfo.get_value()
-        # pan_mod in [-1, 1], map to left/right gains
-        left_gain = np.clip(1.0 - pan_mod * self.pan_lfo.depth, 0.0, 1.0)
-        right_gain = np.clip(1.0 + pan_mod * self.pan_lfo.depth, 0.0, 1.0)
-        block[:, 0] *= left_gain
-        block[:, 1] *= right_gain
-
-        # Update meter if available
-        if self.meter is not None:
-            self.meter.update(block)
-
-        outdata[:] = block
-
-    def is_running(self) -> bool:
-        return self._running
-
-    def set_volume_lfo_rate(self, rate: float):
-        self.volume_lfo.rate = rate
-
-    def set_pan_lfo_rate(self, rate: float):
-        self.pan_lfo.rate = rate
-
-    def set_volume_lfo_depth(self, depth: float):
-        self.volume_lfo.depth = depth
-
-    def set_pan_lfo_depth(self, depth: float):
-        self.pan_lfo.depth = depth
+    async def fade_out(self):
+        """Initiate fade-out sequence."""
+        if self._fade_start_time is not None:
+            return  # already fading
+        self._fade_start_time = time.time()
+        logger.info(f"Fade-out started (duration: {self.fade_duration}
