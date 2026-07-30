@@ -45,96 +45,95 @@ class Biome:
         self.envelope_decay = envelope_decay
         self.grain_duration = grain_duration
         self.sample_rate = sample_rate
-        self.seed = seed
+        self.seed = seed or name
         self.pan_spread = pan_spread
         self.volume_lfo_rate = volume_lfo_rate
         self.pan_lfo_rate = pan_lfo_rate
 
-        # Build wave table deterministically
-        self.wave_table = self._build_wave_table()
+        self._wave_table: Optional[np.ndarray] = None
+        self._envelope: Optional[np.ndarray] = None
 
-    def _build_wave_table(self) -> np.ndarray:
+    def _generate_wave_table(self) -> np.ndarray:
         """
-        Build a wave table as a 2D array: shape (num_waves, num_samples).
-        Each wave is a harmonic series shaped by envelope.
-        Returns a float array with values in [-1, 1].
+        Generate a deterministic wave table from the biome parameters and seed.
+        Returns a 2D numpy array of shape (num_frequencies, num_samples).
         """
-        num_waves = len(self.base_frequencies)
-        num_samples = int(self.sample_rate * self.grain_duration)
-        if num_samples < 1:
-            num_samples = 1
+        num_freqs = len(self.base_frequencies)
+        num_samples = int(self.grain_duration * self.sample_rate)
+        wave_table = np.zeros((num_freqs, num_samples), dtype=np.float64)
 
-        table = np.zeros((num_waves, num_samples), dtype=np.float64)
+        # Deterministic seed variation
+        seed_bytes = self.seed.encode('utf-8')
+        hash_digest = sha256(seed_bytes).hexdigest()
+        seed_int = int(hash_digest[:8], 16)
+        rng = np.random.default_rng(seed_int)
 
         for i, freq in enumerate(self.base_frequencies):
             t = np.arange(num_samples) / self.sample_rate
-            wave = np.zeros_like(t)
+            wave = np.zeros(num_samples, dtype=np.float64)
             for j, amp in enumerate(self.harmonics):
                 harmonic_freq = freq * (j + 1)
-                harmonic = amp * np.sin(2 * np.pi * harmonic_freq * t)
-                wave += harmonic
+                phase = rng.uniform(0, 2 * np.pi)  # random phase for each harmonic
+                wave += amp * np.sin(2 * np.pi * harmonic_freq * t + phase)
+            # Normalize to avoid clipping
+            max_amp = np.max(np.abs(wave))
+            if max_amp > 0:
+                wave /= max_amp
+            wave_table[i, :] = wave
 
-            # Apply envelope (attack + decay)
-            attack_samples = int(self.envelope_attack * self.sample_rate)
-            decay_samples = int(self.envelope_decay * self.sample_rate)
-            if attack_samples + decay_samples > num_samples:
-                # Scale attack/decay proportionally
-                total = attack_samples + decay_samples
-                attack_samples = int(attack_samples * num_samples / total)
-                decay_samples = num_samples - attack_samples
+        self._wave_table = wave_table
+        return wave_table
 
-            envelope = np.ones(num_samples)
-            if attack_samples > 0:
-                envelope[:attack_samples] = np.linspace(0.0, 1.0, attack_samples)
-            if decay_samples > 0:
-                start = num_samples - decay_samples
-                envelope[start:] = np.linspace(1.0, 0.0, decay_samples)
-
-            wave *= envelope
-
-            # Normalize to [-1, 1]
-            peak = np.max(np.abs(wave))
-            if peak > 0:
-                wave /= peak
-
-            table[i] = wave
-
-        # Apply deterministic seed variation if provided
-        if self.seed is not None:
-            seed_bytes = self.seed.encode("utf-8")
-            hash_digest = sha256(seed_bytes).digest()
-            rng = np.random.default_rng(
-                int.from_bytes(hash_digest[:8], "little")
-            )
-            # Add subtle phase offsets to each wave
-            for i in range(num_waves):
-                offset = rng.uniform(0, 1) * 2 * np.pi
-                t = np.arange(num_samples) / self.sample_rate
-                phase_shift = np.sin(2 * np.pi * offset * t)
-                # Blend original with phase-shifted version (10% mix)
-                table[i] = table[i] * 0.9 + phase_shift * 0.1
-                # Re-normalize
-                peak = np.max(np.abs(table[i]))
-                if peak > 0:
-                    table[i] /= peak
-
-        return table
-
-    def get_grain(self, index: int) -> np.ndarray:
+    def _generate_envelope(self) -> np.ndarray:
         """
-        Get a grain from the wave table by index (cyclic).
-        Returns a 1D numpy array of length num_samples.
+        Generate an amplitude envelope for the grain.
+        Returns a 1D numpy array of shape (num_samples,).
         """
-        idx = index % self.wave_table.shape[0]
-        return self.wave_table[idx].copy()
+        num_samples = int(self.grain_duration * self.sample_rate)
+        attack_samples = int(self.envelope_attack * self.sample_rate)
+        decay_samples = int(self.envelope_decay * self.sample_rate)
 
-    @property
-    def num_waves(self) -> int:
-        return self.wave_table.shape[0]
+        envelope = np.ones(num_samples, dtype=np.float64)
 
-    @property
-    def num_samples(self) -> int:
-        return self.wave_table.shape[1]
+        # Attack: linear ramp up
+        if attack_samples > 0:
+            attack_ramp = np.linspace(0.0, 1.0, attack_samples)
+            envelope[:attack_samples] = attack_ramp
+
+        # Decay: linear ramp down
+        if decay_samples > 0:
+            decay_start = num_samples - decay_samples
+            if decay_start < 0:
+                decay_start = 0
+            decay_ramp = np.linspace(1.0, 0.0, num_samples - decay_start)
+            envelope[decay_start:] = decay_ramp
+
+        self._envelope = envelope
+        return envelope
+
+    def get_wave_table(self) -> np.ndarray:
+        """Return the wave table, generating it if necessary."""
+        if self._wave_table is None:
+            self._generate_wave_table()
+        return self._wave_table
+
+    def get_envelope(self) -> np.ndarray:
+        """Return the amplitude envelope, generating it if necessary."""
+        if self._envelope is None:
+            self._generate_envelope()
+        return self._envelope
+
+    def get_grain(self, freq_index: int) -> np.ndarray:
+        """
+        Return a single grain (waveform * envelope) for the given frequency index.
+        """
+        wave_table = self.get_wave_table()
+        envelope = self.get_envelope()
+        return wave_table[freq_index] * envelope
 
     def __repr__(self) -> str:
-        return f"Biome(name='{self.name}', waves={self.num_waves}, samples={self.num_samples}
+        return f"Biome(name='{self.name}', freqs={len(self.base_frequencies)}, harmonics={len(self.harmonics)})"
+
+
+# Predefined biome presets
+BIOME_REGISTRY: Dict[str, Biome] = {}
