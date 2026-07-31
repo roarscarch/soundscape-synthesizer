@@ -1,82 +1,77 @@
-"""Generate random seed phrases for soundscape synthesis."""
+"""
+Seed phrase generation: convert arbitrary text into a deterministic, compact phrase.
+"""
 
+import hashlib
 import random
 from typing import List, Optional
 
+
+# Word lists for generating phrases. Keep them simple and evocative.
 ADJECTIVES = [
-    "misty", "golden", "silent", "deep", "ancient", "crimson", "azure",
-    "gentle", "wild", "luminous", "hollow", "shimmering", "vast", "quiet",
-    "frozen", "molten", "verdant", "stellar", "lunar", "solar"
+    "amber", "azure", "calm", "deep", "distant", "dreamy", "emerald",
+    "frozen", "gentle", "golden", "hollow", "ivory", "lush", "misty",
+    "moonlit", "neon", "oceanic", "quiet", "radiant", "silent", "silver",
+    "soft", "stellar", "tranquil", "velvet", "wandering", "whispering",
+    "wild", "windy", "winter"
 ]
 
 NOUNS = [
-    "forest", "ocean", "space", "meadow", "canyon", "glacier", "desert",
-    "jungle", "tundra", "reef", "nebula", "valley", "peak", "river",
-    "dune", "grove", "cavern", "lagoon", "prairie", "horizon"
+    "aurora", "breeze", "canyon", "cave", "cloud", "coast", "crystal",
+    "dawn", "desert", "dream", "echo", "fjord", "forest", "garden",
+    "glacier", "grove", "harbor", "horizon", "island", "lagoon", "lake",
+    "meadow", "mountain", "night", "ocean", "peak", "rain", "river",
+    "sea", "sky", "star", "stream", "sunset", "temple", "valley",
+    "waterfall", "wood"
 ]
 
 
-def generate_seed_phrase(
-    num_words: int = 2,
-    separator: str = " ",
-    rng: Optional[random.Random] = None
-) -> str:
+def generate_phrase(seed: Optional[str] = None, length: int = 3) -> str:
     """
-    Generate a random seed phrase from curated word lists.
+    Generate a deterministic phrase from a seed string.
 
-    Args:
-        num_words: Number of words in the phrase (must be >= 1).
-        separator: String to join words with.
-        rng: Optional random.Random instance for deterministic generation.
+    The phrase is derived by hashing the seed and using the hash to select
+    words from the word lists. The same seed always produces the same phrase.
 
-    Returns:
-        A seed phrase like "misty forest" or "deep space".
-
-    Raises:
-        ValueError: If num_words is less than 1.
+    :param seed: optional seed string; if None, a random phrase is generated
+    :param length: number of words in the phrase (must be at least 2)
+    :return: a phrase like "misty forest" or "silent ocean"
     """
-    if num_words < 1:
-        raise ValueError("num_words must be at least 1")
+    if length < 2:
+        raise ValueError("Phrase length must be at least 2")
 
-    if rng is None:
-        rng = random
-
-    words: List[str] = []
-    for i in range(num_words):
-        if i % 2 == 0:
-            # Even index (0, 2, ...) -> adjective
-            words.append(rng.choice(ADJECTIVES))
-        else:
-            # Odd index (1, 3, ...) -> noun
+    if seed is None:
+        # Random phrase: use system randomness
+        rng = random.Random()
+        words = [rng.choice(ADJECTIVES), rng.choice(NOUNS)]
+        for _ in range(length - 2):
             words.append(rng.choice(NOUNS))
+        return " ".join(words)
 
-    return separator.join(words)
+    # Deterministic: hash the seed to get a stable integer
+    hash_digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    # Use the first 8 bytes as a 64-bit integer
+    seed_int = int.from_bytes(hash_digest[:8], byteorder="big")
+    rng = random.Random(seed_int)
+
+    # Build the phrase: adjective, then nouns
+    words = [rng.choice(ADJECTIVES), rng.choice(NOUNS)]
+    for _ in range(length - 2):
+        words.append(rng.choice(NOUNS))
+    return " ".join(words)
 
 
-def generate_biome_specific_seed_phrase(
-    biome: str,
-    rng: Optional[random.Random] = None
-) -> str:
+def phrase_to_seed(phrase: str) -> int:
     """
-    Generate a seed phrase that fits a given biome's theme.
+    Convert a phrase to a deterministic integer seed for the WFC algorithm.
 
-    Args:
-        biome: Biome name (e.g., 'forest', 'ocean', 'space').
-        rng: Optional random.Random instance.
-
-    Returns:
-        A seed phrase with at least one word related to the biome.
+    :param phrase: any string
+    :return: a 64-bit integer derived from the phrase
     """
-    if rng is None:
-        rng = random
+    digest = hashlib.sha256(phrase.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big")
 
-    biome_nouns = {
-        "forest": ["forest", "grove", "meadow"],
-        "ocean": ["ocean", "reef", "lagoon"],
-        "space": ["space", "nebula", "stellar"],
-    }
 
-    nouns = biome_nouns.get(biome, NOUNS)
-    adjective = rng.choice(ADJECTIVES)
-    noun = rng.choice(nouns)
-    return f"{adjective} {noun}
+def random_phrase() -> str:
+    """Generate a random three-word phrase using system randomness."""
+    return generate_phrase(None, length=3)
