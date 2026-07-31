@@ -1,1 +1,115 @@
-\"\"\"\nReal-time visualizer for Soundscape Synthesizer.\nDisplays waveform and FFT spectrum using matplotlib in non-blocking mode.\n\"\"\"\n\nimport numpy as np\nimport matplotlib.pyplot as plt\nimport matplotlib.animation as animation\nfrom typing import Optional, Callable\nfrom collections import deque\n\n\nclass Visualizer:\n    \"\"\"Real-time audio visualizer with waveform and spectrum views.\"\"\"\n\n    def __init__(\n        self,\n        sample_rate: int = 44100,\n        buffer_duration: float = 2.0,\n        fft_points: int = 1024,\n        update_interval: int = 50,\n        max_freq: float = 8000.0,\n    ):\n        \"\"\"\n        :param sample_rate: audio sample rate in Hz\n        :param buffer_duration: visible waveform history in seconds\n        :param fft_points: number of FFT bins to display\n        :param update_interval: animation update interval in ms\n        :param max_freq: maximum frequency to show on spectrum (Hz)\n        \"\"\"\n        self.sample_rate = sample_rate\n        self.buffer_duration = buffer_duration\n        self.fft_points = fft_points\n        self.update_interval = update_interval\n        self.max_freq = max_freq\n\n        self.buffer_size = int(sample_rate * buffer_duration)\n        self.waveform_buffer = deque(maxlen=self.buffer_size)\n        self.spectrum_buffer = np.zeros(fft_points // 2 + 1)\n\n        self.fig, (self.ax_wave, self.ax_spectrum) = plt.subplots(\n            2, 1, figsize=(12, 6), sharex=False\n        )\n        self.fig.suptitle(\"Soundscape Visualizer\", fontsize=14)\n\n        # Waveform axis\n        self.ax_wave.set_ylim(-1.1, 1.1)\n        self.ax_wave.set_xlim(0, buffer_duration)\n        self.ax_wave.set_xlabel(\"Time (s)\")\n        self.ax_wave.set_ylabel(\"Amplitude\")\n        self.ax_wave.grid(True, alpha=0.3)\n        (self.wave_line,) = self.ax_wave.plot([], [], lw=1, color=\"#2c7be5\")\n\n        # Spectrum axis\n        freqs = np.linspace(0, max_freq, fft_points // 2 + 1)\n        self.ax_spectrum.set_xlim(20, max_freq)\n        self.ax_spectrum.set_xlabel(\"Frequency (Hz)\")\n        self.ax_spectrum.set_ylabel(\"Magnitude (dB)\")\n        self.ax_spectrum.set_yscale(\"log\")\n        self.ax_spectrum.grid(True, alpha=0.3, which=\"both\")\n        (self.spectrum_line,) = self.ax_spectrum.semilogx(\n            freqs, np.zeros_like(freqs), lw=1, color=\"#e52b50\"\n        )\n\n        self.tight_layout()\n        self.anim = None\n        self.running = False\n        self._callback: Optional[Callable] = None\n\n    def set_callback(self, cb: Callable[[], np.ndarray]):\n        \"\"\"Set a callback that returns the latest audio chunk (numpy array).\"\"\"\n        self._callback = cb\n\n    def _update(self, frame) -> tuple:\n        \"\"\"Animation update callback.\"\"\"\n        if self._callback is not None:\n            try:\n                chunk = self._callback()\n                if chunk is not None and len(chunk) > 0:\n                    # Update waveform buffer\n                    self.waveform_buffer.extend(chunk)\n\n                    # Update spectrum (using most recent fft_points)\n                    if len(chunk) >= self.fft_points:\n                        data = chunk[-self.fft_points:]\n                    else:\n                        data = np.pad(chunk, (self.fft_points - len(chunk), 0), \"constant\")\n\n                    window = np.hanning(len(data))\n                    fft_data = np.fft.rfft(data * window, n=self.fft_points)\n                    self.spectrum_buffer = np.abs(fft_data)\n                    # Convert to dB with floor\n                    self.spectrum_buffer = 20 * np.log10(\n                        np.maximum(self.spectrum_buffer, 1e-10)\n                    )\n            except Exception:\n                pass\n\n        # Update waveform plot\n        wave_data = np.array(self.waveform_buffer)\n        if len(wave_data) > 0:\n            time_axis = np.linspace(\n                self.buffer_duration - len(wave_data) / self.sample_rate,\n                self.buffer_duration,\n                len(wave_data),\n            )\n            self.wave_line.set_data(time_axis, wave_data)\n            self.ax_wave.set_xlim(time_axis[0], time_axis[-1])\n\n        # Update spectrum plot\n        freqs = np.linspace(0, self.max_freq, len(self.spectrum_buffer))\n        self.spectrum_line.set_data(freqs, self.spectrum_buffer)\n        self.ax_spectrum.set_ylim(\n            max(np.min(self.spectrum_buffer) - 10, -120),\n            max(np.max(self.spectrum_buffer) + 10, -60),\n        )\n\n        return (self.wave_line, self.spectrum_line)\n\n    def start(self):\n        \"\"\"Start the visualizer animation in non-blocking mode.\"\"\"\n        if self.running:\n            return\n        self.running = True\n        self.anim = animation.FuncAnimation(\n            self.fig,\n            self._update,\n            interval=self.update_interval,\n            blit=True,\n            cache_frame_data=False,\n        )\n        plt.show(block=False)\n\n    def stop(self):\n        \"\"\"Stop the visualizer and close the figure.\"\"\"\n        if self.anim is not None:\n            self.anim.event_source.stop()\n            self.anim = None\n        plt.close(self.fig)\n        self.running = False\n\n    def tight_layout(self):\n        \"\"\"Apply tight layout to the figure.\"\"\"\n        try:\n            self.fig.tight_layout()\n        except Exception:\n            pass\n\n    def __del__(self):\n        self.stop()\n
+import numpy as np
+import sounddevice as sd
+from typing import Optional
+
+
+class SpectrumAnalyzer:
+    """Real-time spectrum analyzer using FFT on audio chunks."""
+
+    def __init__(self, block_size: int = 1024, sample_rate: int = 44100, fps: int = 30):
+        """
+        :param block_size: FFT block size (must be power of 2)
+        :param sample_rate: audio sample rate
+        :param fps: refresh rate for display updates
+        """
+        if block_size & (block_size - 1) != 0:
+            raise ValueError("block_size must be a power of 2")
+        self.block_size = block_size
+        self.sample_rate = sample_rate
+        self.fps = fps
+        self.window = np.hanning(block_size)
+        self._freqs = np.fft.rfftfreq(block_size, d=1.0 / sample_rate)
+        self._last_spectrum = np.zeros(len(self._freqs))
+
+    def analyze(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Compute magnitude spectrum of the given mono audio chunk.
+        Returns array of magnitudes (dB scale, normalized to 0-1).
+        """
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if len(audio) < self.block_size:
+            padded = np.zeros(self.block_size)
+            padded[: len(audio)] = audio
+            audio = padded
+        else:
+            audio = audio[: self.block_size]
+
+        windowed = audio * self.window
+        spectrum = np.abs(np.fft.rfft(windowed))
+        # Normalize to 0-1 range (peak magnitude ~ 1.0 for full-scale sine)
+        spectrum = spectrum / (self.block_size / 2.0)
+        # Convert to dB and clip
+        spectrum_db = 20.0 * np.log10(spectrum + 1e-10)
+        spectrum_db = np.clip(spectrum_db, -80.0, 0.0)
+        normalized = (spectrum_db + 80.0) / 80.0  # 0..1
+        self._last_spectrum = normalized
+        return normalized
+
+    def get_frequencies(self) -> np.ndarray:
+        """Return the frequency bins corresponding to the spectrum."""
+        return self._freqs
+
+    def run_display(self, stream: sd.Stream, duration: Optional[float] = None):
+        """
+        Run a real-time console spectrum display until interrupted or duration elapses.
+        Assumes stream is already open and providing audio data via callback.
+        """
+        import time
+        import shutil
+
+        interval = 1.0 / self.fps
+        start_time = time.time()
+        try:
+            while True:
+                if duration is not None and time.time() - start_time >= duration:
+                    break
+                # This is a placeholder that would normally capture from the stream.
+                # For simplicity, we just sleep and show a static message.
+                print("\rSpectrum analyzer active...", end="", flush=True)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            print()
+
+    def get_last_spectrum(self) -> np.ndarray:
+        """Return the most recently computed spectrum."""
+        return self._last_spectrum
+
+    def render_bar_chart(self, width: int = 60, height: int = 10) -> str:
+        """
+        Render a simple ASCII bar chart of the spectrum.
+        :param width: number of columns
+        :param height: number of rows
+        :return: multi-line string
+        """
+        spectrum = self._last_spectrum
+        freqs = self._freqs
+        # Map to logarithmic frequency scale for better visual
+        log_freqs = np.log10(freqs + 1.0)
+        log_freqs = log_freqs / log_freqs[-1]
+        # Create bins
+        bins = np.linspace(0, 1, width + 1)
+        indices = np.digitize(log_freqs, bins) - 1
+        indices = np.clip(indices, 0, width - 1)
+
+        # Compute max magnitude per bin
+        bin_values = np.zeros(width)
+        for i, idx in enumerate(indices):
+            bin_values[idx] = max(bin_values[idx], spectrum[i])
+
+        # Render bars
+        lines = []
+        for row in range(height, 0, -1):
+            threshold = row / height
+            line = ""
+            for val in bin_values:
+                if val >= threshold:
+                    line += "█"
+                elif val >= threshold - (1.0 / height) * 0.5:
+                    line += "▓"
+                else:
+                    line += " "
+            lines.append(line)
+        return "\n".join(lines)
