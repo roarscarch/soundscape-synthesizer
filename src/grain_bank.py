@@ -1,98 +1,164 @@
-"""
-Grain bank: stores and selects audio grains deterministically from wave tables.
-Each grain is a short audio snippet shaped by an envelope.
-"""
-
 import numpy as np
-from typing import List, Optional
-from hashlib import sha256
+from typing import List, Tuple, Optional
 
 
 class GrainBank:
-    """Manages a collection of grains derived from a biome's wave table."""
+    """
+    A bank of audio grains used by the soundscape engine.
+    Each grain is a short waveform segment with an envelope.
+    """
 
     def __init__(
         self,
-        wave_table: np.ndarray,
         sample_rate: int = 44100,
-        grain_duration: float = 0.1,
         seed: Optional[str] = None,
     ):
         """
-        :param wave_table: 2D array of shape (num_waves, num_samples) containing base waveforms
         :param sample_rate: sample rate in Hz
-        :param grain_duration: duration of each grain in seconds
-        :param seed: optional seed string for deterministic grain ordering
+        :param seed: optional seed string for deterministic grain generation
         """
-        if wave_table.ndim != 2:
-            raise ValueError(f"wave_table must be 2D, got shape {wave_table.shape}")
-        if wave_table.shape[0] == 0:
-            raise ValueError("wave_table must contain at least one waveform")
-        if grain_duration <= 0:
-            raise ValueError("grain_duration must be positive")
-
-        self.wave_table = wave_table.astype(np.float64)
         self.sample_rate = sample_rate
-        self.grain_duration = grain_duration
-        self.grain_length = int(sample_rate * grain_duration)
-
-        # Seeded PRNG for deterministic grain selection
-        if seed is None:
-            seed = ""
-        seed_bytes = seed.encode("utf-8")
-        hash_digest = sha256(seed_bytes).digest()
-        # Use first 4 bytes as seed for numpy's PCG64
-        self._rng = np.random.Generator(np.random.PCG64(np.frombuffer(hash_digest[:8], dtype=np.uint64)[0]))
-
-        # Precompute grains: for each waveform, generate a grain of length grain_length
+        self.seed = seed or "default"
         self.grains: List[np.ndarray] = []
-        for wave in self.wave_table:
-            grain = self._generate_grain(wave)
-            self.grains.append(grain)
+        self._rng = np.random.default_rng(abs(hash(self.seed)) % (2**32))
 
-        # Shuffle grains deterministically
-        self._indices = list(range(len(self.grains)))
-        self._rng.shuffle(self._indices)
-        self._index = 0
-
-    def _generate_grain(self, waveform: np.ndarray) -> np.ndarray:
-        """Generate a single grain by truncating or looping the waveform and applying an envelope."""
-        # Repeat waveform to fill grain_length if needed
-        repeats = int(np.ceil(self.grain_length / len(waveform)))
-        tiled = np.tile(waveform, repeats)[:self.grain_length]
-        # Apply a smooth attack-decay envelope (raised cosine)
-        envelope = np.ones(self.grain_length)
-        attack_len = min(int(self.sample_rate * 0.01), self.grain_length // 2)
-        decay_len = min(int(self.sample_rate * 0.03), self.grain_length // 2)
-        if attack_len > 0:
-            envelope[:attack_len] = 0.5 * (1 - np.cos(np.linspace(0, np.pi, attack_len)))
-        if decay_len > 0:
-            envelope[-decay_len:] = 0.5 * (1 + np.cos(np.linspace(0, np.pi, decay_len)))
-        return tiled * envelope
-
-    def next_grain(self) -> np.ndarray:
-        """Return the next grain in deterministic sequence. Cycles indefinitely."""
-        idx = self._indices[self._index % len(self._indices)]
-        self._index += 1
-        return self.grains[idx].copy()
-
-    def reset(self) -> None:
-        """Reset the grain sequence to the beginning (deterministic replay)."""
-        self._index = 0
-
-    def interpolate_grain(self, t: float) -> np.ndarray:
+    def generate_grains(
+        self,
+        base_frequencies: List[float],
+        harmonics: List[float],
+        envelope_attack: float,
+        envelope_decay: float,
+        grain_duration: float,
+        count: int = 16,
+    ) -> None:
         """
-        Return a grain that is a linear interpolation between two adjacent grains
-        based on a continuous parameter t in [0, 1). This allows smooth transitions.
+        Generate a set of grains based on biome parameters.
+
+        :param base_frequencies: list of fundamental frequencies (Hz)
+        :param harmonics: amplitude multipliers for harmonic series
+        :param envelope_attack: attack time in seconds
+        :param envelope_decay: decay time in seconds
+        :param grain_duration: duration of each grain in seconds
+        :param count: number of grains to generate
+        """
+        self.grains.clear()
+        num_samples = int(grain_duration * self.sample_rate)
+        if num_samples < 1:
+            num_samples = 1
+        attack_samples = max(1, int(envelope_attack * self.sample_rate))
+        decay_samples = max(1, int(envelope_decay * self.sample_rate))
+
+        # Build a base envelope: linear attack then exponential decay
+        env = np.ones(num_samples, dtype=np.float32)
+        if attack_samples >= num_samples:
+            env *= np.linspace(0.0, 1.0, num_samples, dtype=np.float32)
+        else:
+            env[:attack_samples] = np.linspace(
+                0.0, 1.0, attack_samples, dtype=np.float32
+            )
+            if decay_samples >= num_samples - attack_samples:
+                env[attack_samples:] *= np.linspace(
+                    1.0, 0.0, num_samples - attack_samples, dtype=np.float32
+                )
+            else:
+                decay_start = attack_samples
+                decay_end = attack_samples + decay_samples
+                env[decay_start:decay_end] *= np.linspace(
+                    1.0, 0.0, decay_samples, dtype=np.float32
+                )
+                env[decay_end:] = 0.0
+
+        # Generate each grain as a sum of harmonics with slight detune
+        for _ in range(count):
+            grain = np.zeros(num_samples, dtype=np.float32)
+            for idx, amp in enumerate(harmonics):
+                if amp <= 0:
+                    continue
+                freq = base_frequencies[idx % len(base_frequencies)] * (idx + 1)
+                # Add slight detune for organic feel
+                detune = self._rng.uniform(0.98, 1.02)
+                phase = self._rng.uniform(0.0, 2 * np.pi)
+                t = np.arange(num_samples, dtype=np.float32) / self.sample_rate
+                grain += amp * np.sin(2 * np.pi * freq * detune * t + phase)
+
+            # Normalize to avoid clipping
+            peak = np.max(np.abs(grain))
+            if peak > 0:
+                grain /= peak
+            grain *= env
+            self.grains.append(grain.astype(np.float32))
+
+    def get_grain(self, index: int) -> np.ndarray:
+        """
+        Retrieve a grain by index (modulo count).
+
+        :param index: grain index
+        :return: audio grain as float32 array
         """
         if not self.grains:
-            raise RuntimeError("No grains available")
-        # Map t to a floating index
-        max_idx = len(self.grains) - 1
-        float_idx = t * len(self.grains)
-        idx0 = int(float_idx) % len(self.grains)
-        idx1 = (idx0 + 1) % len(self.grains)
-        frac = float_idx - int(float_idx)
-        grain0 = self.grains[idx0]
-        grain1 = self.grains[idx1]
-        return (1.0 - frac) * grain0 + frac * grain1
+            raise ValueError("No grains generated. Call generate_grains first.")
+        return self.grains[index % len(self.grains)]
+
+    def mix_grains(
+        self,
+        indices: List[int],
+        weights: Optional[List[float]] = None,
+    ) -> np.ndarray:
+        """
+        Mix multiple grains together with optional weights.
+
+        :param indices: list of grain indices
+        :param weights: optional list of weights (same length as indices)
+        :return: mixed audio as float32 array
+        """
+        if not self.grains:
+            raise ValueError("No grains generated. Call generate_grains first.")
+        if weights is None:
+            weights = [1.0] * len(indices)
+        if len(indices) != len(weights):
+            raise ValueError("indices and weights must have the same length")
+
+        # Use the longest grain as the buffer size
+        max_len = max(len(self.grains[i % len(self.grains)]) for i in indices)
+        mix = np.zeros(max_len, dtype=np.float32)
+        for idx, w in zip(indices, weights):
+            grain = self.get_grain(idx)
+            mix[: len(grain)] += w * grain
+
+        # Normalize to prevent clipping
+        peak = np.max(np.abs(mix))
+        if peak > 0:
+            mix /= peak
+        return mix
+
+    def apply_lfo(
+        self,
+        audio: np.ndarray,
+        lfo_volume: np.ndarray,
+        lfo_pan: np.ndarray,
+        pan_spread: float = 0.5,
+    ) -> np.ndarray:
+        """
+        Apply volume and pan LFOs to a mono audio signal, producing stereo output.
+
+        :param audio: mono audio as float32 array
+        :param lfo_volume: volume modulation values (0.0 to 1.0), same length as audio
+        :param lfo_pan: pan modulation values (-1.0 to 1.0), same length as audio
+        :param pan_spread: stereo spread factor (0.0 = mono, 1.0 = full stereo)
+        :return: stereo audio as float32 array of shape (n_samples, 2)
+        """
+        n = len(audio)
+        if len(lfo_volume) != n or len(lfo_pan) != n:
+            raise ValueError("LFO arrays must have the same length as audio")
+
+        # Ensure volume stays within safe range
+        vol = np.clip(lfo_volume, 0.0, 1.0)
+        pan = np.clip(lfo_pan, -1.0, 1.0) * pan_spread
+
+        # Equal-power panning
+        left_gain = np.cos((pan + 1.0) * np.pi / 4.0)
+        right_gain = np.sin((pan + 1.0) * np.pi / 4.0)
+
+        left = audio * vol * left_gain
+        right = audio * vol * right_gain
+        return np.stack([left, right], axis=1).astype(np.float32)
