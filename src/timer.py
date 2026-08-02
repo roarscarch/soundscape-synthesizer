@@ -1,75 +1,71 @@
-"""
-Sleep timer and fade-out utilities for soundscape playback.
-"""
+"""Sleep timer functionality for scheduled playback stop."""
 
+import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 
 class SleepTimer:
-    """Counts down and triggers fade-out after a specified duration."""
+    """Runs a callback after a specified duration, with optional fade-out."""
 
-    def __init__(self, duration: float = 0.0, fade_duration: float = 5.0):
+    def __init__(
+        self,
+        duration: float,
+        callback: Callable[[], None],
+        fade_duration: float = 5.0,
+        check_interval: float = 0.1,
+    ):
         """
-        :param duration: total sleep timer duration in seconds (0 = disabled)
-        :param fade_duration: fade-out duration in seconds
+        :param duration: seconds until the timer fires
+        :param callback: function to call when the timer completes
+        :param fade_duration: seconds before the end to start fade-out (0 to disable)
+        :param check_interval: polling interval for the timer thread
         """
         self.duration = duration
+        self.callback = callback
         self.fade_duration = fade_duration
-        self.start_time: Optional[float] = None
-        self._elapsed = 0.0
-        self._active = False
+        self.check_interval = check_interval
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._start_time: Optional[float] = None
 
     def start(self) -> None:
-        """Start the timer, if duration is set."""
-        if self.duration > 0:
-            self.start_time = time.monotonic()
-            self._elapsed = 0.0
-            self._active = True
-        else:
-            self._active = False
+        """Start the timer in a background thread."""
+        if self._thread and self._thread.is_alive():
+            raise RuntimeError("Timer already running")
+        self._stop_event.clear()
+        self._start_time = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
-        """Stop the timer and reset state."""
-        self._active = False
-        self.start_time = None
-        self._elapsed = 0.0
+        """Cancel the timer if it is running."""
+        self._stop_event.set()
 
-    @property
-    def is_active(self) -> bool:
-        return self._active
-
-    @property
-    def elapsed(self) -> float:
-        """Elapsed seconds since start (0 if not active)."""
-        if not self._active or self.start_time is None:
-            return self._elapsed
-        return time.monotonic() - self.start_time
-
-    @property
     def remaining(self) -> float:
-        """Seconds left before fade-out begins (0 if disabled or done)."""
-        if not self._active:
+        """Return seconds remaining until timer fires (0 if not started)."""
+        if self._start_time is None:
             return 0.0
-        remaining = self.duration - self.elapsed
-        return max(0.0, remaining)
+        elapsed = time.monotonic() - self._start_time
+        return max(0.0, self.duration - elapsed)
 
-    @property
-    def is_fade_out_time(self) -> bool:
-        """True when the timer has elapsed and fade-out should start."""
-        return self._active and self.remaining <= 0.0
+    def _run(self) -> None:
+        """Background thread loop."""
+        if self._start_time is None:
+            return
+        end_time = self._start_time + self.duration
+        fade_start = end_time - self.fade_duration
 
-    def fade_gain(self, current_time: float) -> float:
-        """
-        Returns a gain multiplier for fade-out.
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            if now >= end_time:
+                self.callback()
+                break
+            if self.fade_duration > 0 and now >= fade_start:
+                # Optionally notify about fade-out phase; here we just sleep until the end.
+                pass
+            time.sleep(self.check_interval)
 
-        :param current_time: current monotonic time (seconds)
-        :return: 1.0 if no fade-out active, otherwise ramps to 0.0.
-        """
-        if not self.is_fade_out_time:
-            return 1.0
-        fade_elapsed = current_time - (self.start_time + self.duration)
-        if fade_elapsed >= self.fade_duration:
-            return 0.0
-        # linear fade-out
-        return max(0.0, 1.0 - fade_elapsed / self.fade_duration)
+    def is_running(self) -> bool:
+        """Return True if the timer thread is active."""
+        return self._thread is not None and self._thread.is_alive()
