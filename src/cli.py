@@ -41,119 +41,185 @@ Examples:
         "--duration",
         type=float,
         default=None,
-        help="Duration in seconds for the soundscape (default: infinite)",
-    )
-
-    parser.add_argument(
-        "--sleep",
-        type=float,
-        default=None,
-        help="Sleep timer in minutes after which the soundscape fades out and stops",
-    )
-
-    parser.add_argument(
-        "--fade",
-        type=float,
-        default=10.0,
-        help="Fade-out duration in seconds when sleep timer expires (default: 10.0)",
+        help="Duration in seconds (default: infinite)",
     )
 
     parser.add_argument(
         "--export",
         type=str,
         default=None,
-        help="Path to export the current soundscape as a WAV file (ongoing export when used with --duration)",
+        metavar="FILE",
+        help="Export the generated soundscape to a WAV file and exit",
     )
 
     parser.add_argument(
-        "--no-visualizer",
+        "--format",
+        type=str,
+        choices=["wav", "flac", "ogg"],
+        default="wav",
+        help="Export format (default: wav)",
+    )
+
+    parser.add_argument(
+        "--bit-depth",
+        type=int,
+        choices=[16, 24, 32],
+        default=16,
+        help="Bit depth for export (default: 16)",
+    )
+
+    parser.add_argument(
+        "--volume",
+        type=float,
+        default=1.0,
+        help="Master volume (0.0 to 1.0, default: 1.0)",
+    )
+
+    parser.add_argument(
+        "--pan-lfo-rate",
+        type=float,
+        default=None,
+        help="Pan LFO rate in Hz (overrides biome default)",
+    )
+
+    parser.add_argument(
+        "--volume-lfo-rate",
+        type=float,
+        default=None,
+        help="Volume LFO rate in Hz (overrides biome default)",
+    )
+
+    parser.add_argument(
+        "--stereo-width",
+        type=float,
+        default=1.0,
+        help="Stereo width factor (0.0 = mono, 1.0 = full stereo, default: 1.0)",
+    )
+
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=None,
+        help="Sleep timer in seconds before auto fade-out and exit",
+    )
+
+    parser.add_argument(
+        "--fade",
+        type=float,
+        default=5.0,
+        help="Fade-out duration in seconds (default: 5.0)",
+    )
+
+    parser.add_argument(
+        "--no-meter",
         action="store_true",
-        help="Disable the real-time visualizer",
+        help="Disable real-time audio level meter",
     )
 
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[list] = None) -> None:
-    """Entry point for the soundscape synthesizer."""
+def get_biome_from_seed(seed: str, biome_name: str) -> Biome:
+    """
+    Get a biome instance, optionally varying its parameters based on the seed.
+    This ensures that the same seed always produces the same biome, but different
+    seeds produce slightly different variations of the same biome.
+    """
+    import hashlib
+
+    base = BIOME_REGISTRY[biome_name]
+    # Create a deterministic hash from the seed phrase to vary parameters.
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    # Use the first 4 bytes as a float in [0, 1)
+    variation = int.from_bytes(digest[:4], "big") / (2**32 - 1)
+
+    # Vary base frequencies by up to +/- 5% (but keep relative spacing)
+    freq_scale = 1.0 + (variation - 0.5) * 0.1
+    base_frequencies = [f * freq_scale for f in base.base_frequencies]
+
+    # Vary envelope times slightly (e.g., up to +/- 20%)
+    attack_scale = 1.0 + (variation - 0.5) * 0.4
+    decay_scale = 1.0 + ((variation * 7) % 1.0 - 0.5) * 0.4
+
+    # Vary grain duration slightly
+    grain_duration = base.grain_duration * (1.0 + (variation - 0.5) * 0.2)
+
+    # Create a new Biome with the varied parameters.
+    return Biome(
+        name=base.name,
+        base_frequencies=base_frequencies,
+        harmonics=base.harmonics,
+        envelope_attack=base.envelope_attack * attack_scale,
+        envelope_decay=base.envelope_decay * decay_scale,
+        grain_duration=grain_duration,
+        sample_rate=base.sample_rate,
+        seed=seed,  # Pass the seed to ensure deterministic wave table
+        pan_spread=base.pan_spread,
+        volume_lfo_rate=base.volume_lfo_rate,
+        pan_lfo_rate=base.pan_lfo_rate,
+    )
+
+
+def main(argv: Optional[list] = None) -> int:
+    """Main entry point for the CLI."""
     args = parse_args(argv)
 
-    # Validate seed
-    if not args.seed.strip():
-        print("Error: seed phrase cannot be empty.")
-        sys.exit(1)
+    # Build the biome with seed-based variation
+    biome = get_biome_from_seed(args.seed, args.biome)
 
-    # Load biome
-    try:
-        biome = BIOME_REGISTRY[args.biome]
-    except KeyError:
-        print(f"Error: unknown biome '{args.biome}'. Available: {', '.join(BIOME_REGISTRY.keys())}")
-        sys.exit(1)
+    # Override LFO rates if specified
+    if args.volume_lfo_rate is not None:
+        biome.volume_lfo_rate = args.volume_lfo_rate
+    if args.pan_lfo_rate is not None:
+        biome.pan_lfo_rate = args.pan_lfo_rate
 
-    print(f"Using biome: {biome.name}")
-    print(f"Seed phrase: {args.seed}")
+    # Build the engine
+    engine = SoundscapeEngine(
+        biome=biome,
+        seed_phrase=args.seed,
+        sample_rate=44100,
+    )
 
-    # Initialize engine and player
-    engine = SoundscapeEngine(seed=args.seed, grain_bank=biome)
-    player = AudioPlayer(sample_rate=44100)
+    # Set stereo width
+    engine.stereo_width = args.stereo_width
 
-    # Handle export mode
-    export_path = args.export
+    # Set master volume
+    engine.master_volume = args.volume
 
-    # Set up sleep timer
-    sleep_timer = args.sleep
-    fade_duration = args.fade
+    # Configure fade-out
+    if args.fade > 0:
+        engine.fade_duration = args.fade
 
-    # Duration for generation (None means infinite)
-    duration = args.duration
+    # Configure sleep timer
+    if args.sleep is not None and args.sleep > 0:
+        engine.sleep_timer = args.sleep
 
-    # Graceful shutdown
-    stop_event = [False]
+    # Set up export if requested
+    if args.export:
+        engine.export_path = args.export
+        engine.export_format = args.format
+        engine.export_bit_depth = args.bit_depth
 
-    def signal_handler(sig, frame):
-        print("\nShutting down...")
-        stop_event[0] = True
+    # Create audio player
+    player = AudioPlayer(
+        engine=engine,
+        sample_rate=44100,
+        channels=2,
+        enable_meter=not args.no_meter,
+    )
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Start playback
-    player.play(engine, duration=duration, sleep_timer=sleep_timer, fade_duration=fade_duration)
-
-    # If export requested, wait for playback to finish then export
-    if export_path:
-        # For export, we need to run for the full duration or until interrupted
-        if duration is not None:
-            # Run until duration expires
-            start_time = time.time()
-            while time.time() - start_time < duration:
-                if stop_event[0]:
-                    break
-                time.sleep(0.1)
-            player.stop()
-        elif sleep_timer is not None:
-            # Run until sleep timer triggers (handled by player)
-            while not stop_event[0]:
-                time.sleep(0.1)
-        else:
-            # Infinite mode with export: user must interrupt
-            print("Exporting in infinite mode. Press Ctrl+C to stop and export.")
-            while not stop_event[0]:
-                time.sleep(0.1)
-
-        # Export the audio buffer
-        try:
-            player.export(export_path)
-            print(f"Exported soundscape to {export_path}")
-        except Exception as e:
-            print(f"Export failed: {e}")
-            sys.exit(1)
-    else:
-        # No export: block until playback ends
-        while player.is_playing() and not stop_event[0]:
-            time.sleep(0.1)
+    # Install signal handlers for graceful exit
+    def handle_signal(signum, frame):
+        print("\
+Stopping...")
         player.stop()
+        raise KeyboardInterrupt
 
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
-if __name__ == "__main__":
-    main()
+    try:
+        player.start()
+        # If a duration is specified, stop after that duration
+        if args.duration is not None:
+            print(f"Playing for {args.duration}
