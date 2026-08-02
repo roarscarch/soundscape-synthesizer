@@ -50,123 +50,97 @@ class Biome:
         self.volume_lfo_rate = volume_lfo_rate
         self.pan_lfo_rate = pan_lfo_rate
 
-        # Deterministic variation based on seed
-        self._rng = np.random.default_rng(self._derive_seed(seed))
-        self._freq_multiplier = self._rng.uniform(0.95, 1.05)
-        self._harmonic_jitter = self._rng.uniform(0.9, 1.1, len(harmonics))
-
+        # Precompute the wave table for this biome
         self.wave_table = self._build_wave_table()
-
-    def _derive_seed(self, seed: Optional[str]) -> int:
-        """Convert seed string to a deterministic integer."""
-        if seed is None:
-            return 0
-        return int(sha256(seed.encode()).hexdigest()[:8], 16)
 
     def _build_wave_table(self) -> np.ndarray:
         """
-        Build a wave table as a 2D array of shape (num_waves, num_samples).
-        Each wave is a harmonic series with envelope applied.
+        Build a wave table by summing harmonic series for each base frequency.
+        The result is normalized and shaped to (num_frequencies, num_samples).
         """
-        num_waves = len(self.base_frequencies)
-        num_samples = int(self.sample_rate * self.grain_duration)
-        if num_samples <= 0:
-            raise ValueError("grain_duration must be positive")
+        # Use a deterministic PRNG based on the seed string if provided
+        rng = np.random.default_rng(
+            int(sha256((self.seed or self.name).encode()).hexdigest(), 16) % (2**32)
+        )
 
-        t = np.linspace(0, self.grain_duration, num_samples, endpoint=False)
-        wave_table = np.zeros((num_waves, num_samples), dtype=np.float32)
+        num_samples = int(self.sample_rate * self.grain_duration)
+        table = np.zeros((len(self.base_frequencies), num_samples), dtype=np.float32)
 
         for i, freq in enumerate(self.base_frequencies):
-            adjusted_freq = freq * self._freq_multiplier
+            t = np.arange(num_samples) / self.sample_rate
             wave = np.zeros(num_samples, dtype=np.float32)
-            for h, amp in enumerate(self.harmonics):
-                if h == 0:
-                    continue
-                harmonic_amp = amp * self._harmonic_jitter[h]
-                wave += harmonic_amp * np.sin(2 * np.pi * adjusted_freq * h * t)
+            for harmonic_idx, amp in enumerate(self.harmonics):
+                # Add slight detune per harmonic for organic texture
+                detune = rng.uniform(-0.5, 0.5) * (harmonic_idx + 1) * 0.1
+                wave += amp * np.sin(2 * np.pi * (freq * (harmonic_idx + 1) + detune) * t)
+            # Normalize to avoid clipping
+            peak = np.max(np.abs(wave))
+            if peak > 0:
+                wave /= peak
+            table[i] = wave
 
-            # Normalize to [-1, 1]
-            peak = np.max(np.abs(wave)) if np.max(np.abs(wave)) > 0 else 1.0
-            wave = wave / peak * 0.8
+        return table
 
-            # Apply envelope: attack and decay
-            attack_samples = int(self.envelope_attack * self.sample_rate)
-            decay_samples = int(self.envelope_decay * self.sample_rate)
-            attack_samples = min(attack_samples, num_samples // 2)
-            decay_samples = min(decay_samples, num_samples // 2)
+    def get_grain(self, frequency_index: int, phase: float = 0.0) -> np.ndarray:
+        """
+        Return a grain of audio based on the frequency index and phase offset.
+        The grain is windowed with a simple attack-decay envelope.
+        """
+        wave = self.wave_table[frequency_index % len(self.base_frequencies)]
+        # Apply phase offset (in samples)
+        offset = int(phase * len(wave)) % len(wave)
+        grain = np.roll(wave, offset)
 
-            envelope = np.ones(num_samples, dtype=np.float32)
-            if attack_samples > 0:
-                envelope[:attack_samples] = np.linspace(0.0, 1.0, attack_samples, dtype=np.float32)
-            if decay_samples > 0:
-                start = num_samples - decay_samples
-                envelope[start:] = np.linspace(1.0, 0.0, decay_samples, dtype=np.float32)
+        # Apply envelope
+        env = np.ones_like(grain)
+        attack_samples = int(self.envelope_attack * self.sample_rate)
+        decay_samples = int(self.envelope_decay * self.sample_rate)
+        if attack_samples > 0:
+            env[:attack_samples] = np.linspace(0.0, 1.0, attack_samples, dtype=np.float32)
+        if decay_samples > 0:
+            env[-decay_samples:] = np.linspace(1.0, 0.0, decay_samples, dtype=np.float32)
+        return grain * env
 
-            wave_table[i] = wave * envelope
-
-        return wave_table
-
-    def get_wave(self, index: int) -> np.ndarray:
-        """Get a specific wave from the wave table."""
-        return self.wave_table[index % self.wave_table.shape[0]]
-
-    def get_wave_count(self) -> int:
-        return self.wave_table.shape[0]
-
-
-# --- Biome Presets ---
+    def __repr__(self) -> str:
+        return f"Biome(name={self.name!r}, freqs={self.base_frequencies})"
 
 
-def _forest_biome() -> Biome:
-    return Biome(
+# Registry of available biomes
+BIOME_REGISTRY: Dict[str, Biome] = {
+    "forest": Biome(
         name="forest",
-        base_frequencies=[55.0, 82.41, 110.0, 164.81],  # A1, E2, A2, E3
-        harmonics=[1.0, 0.5, 0.25, 0.15, 0.08],
-        envelope_attack=0.3,
-        envelope_decay=1.2,
+        base_frequencies=[110.0, 165.0, 220.0, 275.0],
+        harmonics=[1.0, 0.5, 0.3, 0.15],
+        envelope_attack=0.1,
+        envelope_decay=0.4,
         grain_duration=2.0,
-        sample_rate=44100,
-        seed="forest",
+        seed="forest-seed",
         pan_spread=0.7,
         volume_lfo_rate=0.08,
         pan_lfo_rate=0.04,
-    )
-
-
-def _ocean_biome() -> Biome:
-    return Biome(
+    ),
+    "ocean": Biome(
         name="ocean",
-        base_frequencies=[41.2, 55.0, 65.41, 82.41],  # E1, A1, C2, E2
-        harmonics=[1.0, 0.3, 0.15, 0.1, 0.05],
-        envelope_attack=0.5,
-        envelope_decay=2.0,
+        base_frequencies=[55.0, 82.5, 110.0, 165.0],
+        harmonics=[1.0, 0.4, 0.2, 0.1],
+        envelope_attack=0.05,
+        envelope_decay=0.8,
         grain_duration=3.0,
-        sample_rate=44100,
-        seed="ocean",
+        seed="ocean-seed",
         pan_spread=0.9,
+        volume_lfo_rate=0.12,
+        pan_lfo_rate=0.06,
+    ),
+    "space": Biome(
+        name="space",
+        base_frequencies=[220.0, 330.0, 440.0, 550.0],
+        harmonics=[1.0, 0.8, 0.5, 0.3],
+        envelope_attack=0.2,
+        envelope_decay=1.0,
+        grain_duration=4.0,
+        seed="space-seed",
+        pan_spread=0.5,
         volume_lfo_rate=0.05,
         pan_lfo_rate=0.03,
-    )
-
-
-def _space_biome() -> Biome:
-    return Biome(
-        name="space",
-        base_frequencies=[27.5, 36.71, 55.0, 73.42],  # A0, D1, A1, D2
-        harmonics=[1.0, 0.2, 0.1, 0.05, 0.02],
-        envelope_attack=0.8,
-        envelope_decay=3.0,
-        grain_duration=4.0,
-        sample_rate=44100,
-        seed="space",
-        pan_spread=1.0,
-        volume_lfo_rate=0.03,
-        pan_lfo_rate=0.02,
-    )
-
-
-BIOME_REGISTRY: Dict[str, Biome] = {
-    "forest": _forest_biome(),
-    "ocean": _ocean_biome(),
-    "space": _space_biome(),
+    ),
 }
