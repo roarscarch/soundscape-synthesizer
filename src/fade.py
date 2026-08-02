@@ -1,4 +1,4 @@
-"""Audio fade-out utilities for the soundscape synthesizer."""
+"""Audio fade-out utility for gentle soundscape endings."""
 
 import numpy as np
 from typing import Optional
@@ -6,77 +6,51 @@ from typing import Optional
 
 def apply_fade_out(
     audio: np.ndarray,
-    sample_rate: int,
-    fade_duration: float = 5.0,
-    shape: str = "linear",
+    fade_duration: float,
+    sample_rate: int = 44100,
+    curve: str = "linear",
 ) -> np.ndarray:
-    """Apply a fade-out envelope to the audio array.
+    """
+    Apply a fade-out envelope to the end of an audio buffer.
 
     Args:
-        audio: Audio data as a 2D array of shape (channels, samples).
-        sample_rate: Sample rate in Hz.
+        audio: Audio buffer of shape (samples,) for mono or (samples, channels) for stereo.
         fade_duration: Duration of the fade in seconds.
-        shape: Fade shape, either 'linear' or 'cosine'.
+        sample_rate: Sample rate in Hz.
+        curve: Fade curve type. Options: 'linear', 'exponential', 'cosine'.
 
     Returns:
-        The audio with the fade applied in-place (returns a new array).
-    """
-    if audio.ndim != 2:
-        raise ValueError(f"Expected 2D audio array, got {audio.ndim}D")
+        The audio buffer with the fade applied.
 
+    Raises:
+        ValueError: If fade_duration is non-positive or longer than the audio length.
+        ValueError: If curve is not a known type.
+    """
+    if fade_duration <= 0:
+        raise ValueError("fade_duration must be positive")
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+
+    num_samples = audio.shape[0]
     fade_samples = int(fade_duration * sample_rate)
-    if fade_samples <= 0:
+    if fade_samples > num_samples:
+        raise ValueError("fade_duration cannot exceed audio duration")
+    if fade_samples == 0:
         return audio.copy()
 
-    if fade_samples > audio.shape[1]:
-        fade_samples = audio.shape[1]
+    # Envelope over the fade region
+    t = np.linspace(1.0, 0.0, fade_samples, dtype=np.float64)
 
-    start = audio.shape[1] - fade_samples
-    if shape == "linear":
-        envelope = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
-    elif shape == "cosine":
-        # Cosine curve from 1 to 0, smooth at both ends
-        t = np.linspace(0.0, np.pi / 2.0, fade_samples, dtype=np.float32)
-        envelope = np.cos(t)
+    if curve == "linear":
+        envelope = t
+    elif curve == "exponential":
+        # Exponential taper: start at 1.0, end near 0.0, with a smoother tail
+        # Avoid division by zero by using a small epsilon.
+        epsilon = 1e-6
+        envelope = (np.exp(-3.0 * np.linspace(0.0, 1.0, fade_samples)) - epsilon) / (np.exp(-3.0) - epsilon)
+        envelope = np.clip(envelope, 0.0, 1.0)
+    elif curve == "cosine":
+        # Cosine curve: starts at 1.0, ends at 0.0, smooth both ends
+        envelope = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, fade_samples)))
     else:
-        raise ValueError(f"Unknown fade shape: {shape}")
-
-    result = audio.copy()
-    result[:, start:] *= envelope
-    return result
-
-
-def apply_fade_in(
-    audio: np.ndarray,
-    sample_rate: int,
-    fade_duration: float = 2.0,
-    shape: str = "linear",
-) -> np.ndarray:
-    """Apply a fade-in envelope to the audio array.
-
-    Args:
-        audio: Audio data as a 2D array of shape (channels, samples).
-        sample_rate: Sample rate in Hz.
-        fade_duration: Duration of the fade in seconds.
-        shape: Fade shape, either 'linear' or 'cosine'.
-
-    Returns:
-        The audio with the fade applied in-place (returns a new array).
-    """
-    if audio.ndim != 2:
-        raise ValueError(f"Expected 2D audio array, got {audio.ndim}D")
-
-    fade_samples = int(fade_duration * sample_rate)
-    if fade_samples <= 0:
-        return audio.copy()
-
-    if fade_samples > audio.shape[1]:
-        fade_samples = audio.shape[1]
-
-    if shape == "linear":
-        envelope = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
-    elif shape == "cosine":
-        t = np.linspace(0.0, np.pi / 2.0, fade_samples, dtype=np.float32)
-        envelope = np.sin(t)
-    else:
-        raise ValueError(f"Unknown fade shape: {shape}
+        raise ValueError(f"Unknown curve type: {curve}
